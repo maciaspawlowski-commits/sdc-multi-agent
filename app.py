@@ -99,10 +99,21 @@ _request_counter: Optional[metrics.Counter] = None
 # OpenAI client pointing at Ollama's OpenAI-compatible endpoint
 _llm_client: Optional[OpenAI] = None
 
+# Check gauge — 0 = passing, 1 = failing; one observation per named check
+_check_gauge: Optional[metrics.ObservableGauge] = None
+
+# Rolling window counters for watchdog (updated by chat + synthetic traffic)
+_window_total: int = 0
+_window_errors: int = 0
+_window_latencies: list[float] = []
+_LATENCY_THRESHOLD_MS = float(os.getenv("LATENCY_THRESHOLD_MS", "8000"))
+_ERROR_RATE_THRESHOLD = float(os.getenv("ERROR_RATE_THRESHOLD", "0.15"))
+_WATCHDOG_INTERVAL = int(os.getenv("WATCHDOG_INTERVAL_SECONDS", "30"))
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _tracer, _token_counter, _duration_hist, _request_counter, _llm_client
+    global _tracer, _token_counter, _duration_hist, _request_counter, _llm_client, _check_gauge
 
     from otel import setup_telemetry
     setup_telemetry(app)
@@ -124,6 +135,11 @@ async def lifespan(app: FastAPI):
         unit="requests",
         description="Total LLM chat requests",
     )
+    _check_gauge = meter.create_observable_gauge(
+        "llm.check.status",
+        callbacks=[_collect_check_observations],
+        description="Health check status: 0 = passing, 1 = failing",
+    )
 
     ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
     _llm_client = OpenAI(
@@ -134,10 +150,89 @@ async def lifespan(app: FastAPI):
     model = os.getenv("LLM_MODEL", "llama3.2")
     logger.info("LLM Demo ready — http://localhost:8000  (model: %s, via LLMetry)", model)
 
-    task = asyncio.create_task(_synthetic_traffic_loop())
+    synthetic_task = asyncio.create_task(_synthetic_traffic_loop())
+    watchdog_task = asyncio.create_task(_watchdog_loop())
     yield
-    task.cancel()
+    synthetic_task.cancel()
+    watchdog_task.cancel()
     logger.info("LLM Demo shutting down")
+
+
+# ── Health check state ───────────────────────────────────────────────────────
+# Populated by watchdog; read by the observable gauge callback each export cycle.
+_check_observations: dict[str, int] = {}  # check_name → 0 (pass) | 1 (fail)
+
+
+def _collect_check_observations(options):
+    """Observable gauge callback — yields one observation per named check."""
+    from opentelemetry.metrics import Observation
+    for check_name, status in list(_check_observations.items()):
+        yield Observation(status, {"check.name": check_name, "service": "llm-demo"})
+
+
+async def _watchdog_loop():
+    """Periodically evaluate health checks and update the llm.check.status gauge."""
+    global _window_total, _window_errors, _window_latencies
+
+    await asyncio.sleep(15)  # let traffic accumulate first
+    while True:
+        try:
+            # ── Check 1: error rate ──────────────────────────────────────
+            total = _window_total
+            errors = _window_errors
+            latencies = list(_window_latencies)
+
+            # reset window
+            _window_total = 0
+            _window_errors = 0
+            _window_latencies = []
+
+            if total > 0:
+                error_rate = errors / total
+                failing = error_rate > _ERROR_RATE_THRESHOLD
+                _check_observations["error_rate"] = 1 if failing else 0
+                level = "ERROR" if failing else "INFO"
+                getattr(logger, level.lower())(
+                    "check %s name=error_rate value=%.2f threshold=%.2f total=%d errors=%d",
+                    "FAILED" if failing else "OK",
+                    error_rate, _ERROR_RATE_THRESHOLD, total, errors,
+                )
+            else:
+                _check_observations["error_rate"] = 0
+
+            # ── Check 2: p95 latency ─────────────────────────────────────
+            if latencies:
+                latencies.sort()
+                p95 = latencies[int(len(latencies) * 0.95)]
+                failing = p95 > _LATENCY_THRESHOLD_MS
+                _check_observations["latency_p95"] = 1 if failing else 0
+                level = "ERROR" if failing else "INFO"
+                getattr(logger, level.lower())(
+                    "check %s name=latency_p95 value=%.0fms threshold=%.0fms",
+                    "FAILED" if failing else "OK",
+                    p95, _LATENCY_THRESHOLD_MS,
+                )
+            else:
+                _check_observations["latency_p95"] = 0
+
+            # ── Check 3: processor reachability ──────────────────────────
+            try:
+                resp = httpx.get(f"{_PROCESSOR_URL}/health", timeout=2)
+                processor_ok = resp.status_code == 200
+            except Exception:
+                processor_ok = False
+            _check_observations["processor_reachable"] = 0 if processor_ok else 1
+            if not processor_ok:
+                logger.error("check FAILED name=processor_reachable url=%s/health", _PROCESSOR_URL)
+            else:
+                logger.info("check OK name=processor_reachable")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning("watchdog error: %s", exc)
+
+        await asyncio.sleep(_WATCHDOG_INTERVAL)
 
 
 async def _synthetic_traffic_loop():
@@ -170,6 +265,7 @@ async def _synthetic_traffic_loop():
                         span.record_exception(Exception(err_msg))
                         _request_counter.add(1, {**attrs, "status": "error"})
                         _duration_hist.record(latency_ms, {**attrs, "error": "true"})
+                        _window_total += 1; _window_errors += 1; _window_latencies.append(latency_ms)
                         logger.error("synthetic error type=%s msg=%s", err_type, err_msg)
                         _broadcast({"prompt": prompt, "error": err_msg, "error_type": err_type,
                                     "latency_ms": round(latency_ms, 1)})
@@ -195,6 +291,7 @@ async def _synthetic_traffic_loop():
                         _token_counter.add(input_tokens, {**attrs, "gen_ai.token.type": "input"})
                     _token_counter.add(output_tokens, {**attrs, "gen_ai.token.type": "output"})
                     _duration_hist.record(latency_ms, attrs)
+                    _window_total += 1; _window_latencies.append(latency_ms)
 
                     logger.info(
                         "synthetic traffic ok in=%d out=%d latency_ms=%.0f sentiment=%s",
@@ -331,6 +428,7 @@ def chat(req: ChatRequest, http_req: Request):
                     _token_counter.add(input_tokens, {**attrs, "gen_ai.token.type": "input"})
                 _token_counter.add(output_tokens, {**attrs, "gen_ai.token.type": "output"})
                 _duration_hist.record(latency_ms, attrs)
+                _window_total += 1; _window_latencies.append(latency_ms)
 
                 logger.info(
                     "chat ok session=%s model=%s in=%d out=%d latency_ms=%.0f sentiment=%s",
@@ -353,6 +451,7 @@ def chat(req: ChatRequest, http_req: Request):
                 span.set_attribute("error.type", type(exc).__name__)
                 _request_counter.add(1, {**attrs, "status": "error"})
                 _duration_hist.record(latency_ms, {**attrs, "error": "true"})
+                _window_total += 1; _window_errors += 1; _window_latencies.append(latency_ms)
                 logger.error(
                     "chat failed session=%s model=%s error=%s",
                     session_id, model, exc,
