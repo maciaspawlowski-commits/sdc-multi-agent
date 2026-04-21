@@ -41,7 +41,7 @@ _SYNTHETIC_ERRORS = [
 ]
 
 _ERROR_RATE = float(os.getenv("SYNTHETIC_ERROR_RATE", "0.2"))  # 20% chance of error
-APP_VERSION = os.getenv("APP_VERSION", "6.0.0")
+APP_VERSION = os.getenv("APP_VERSION", "6.1.0")
 
 _SYNTHETIC_INTERVAL = int(os.getenv("SYNTHETIC_INTERVAL_SECONDS", "5"))
 

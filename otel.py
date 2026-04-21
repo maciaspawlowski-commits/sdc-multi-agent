@@ -33,7 +33,7 @@ def setup_telemetry(app=None, service_name: str = None, service_version: str = N
     resource = Resource.create(
         {
             "service.name": service_name or os.getenv("OTEL_SERVICE_NAME", "llm-demo"),
-            "service.version": service_version or os.getenv("APP_VERSION", "6.0.0"),
+            "service.version": service_version or os.getenv("APP_VERSION", "6.1.0"),
             "deployment.environment": os.getenv("ENVIRONMENT", "local"),
         }
     )
