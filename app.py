@@ -10,17 +10,18 @@ load_dotenv()
 import logging
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from opentelemetry import metrics, trace
+from opentelemetry import baggage, context, metrics, trace
 from pydantic import BaseModel
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s"
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -28,11 +29,12 @@ logger = logging.getLogger(__name__)
 _tracer: Optional[trace.Tracer] = None
 _token_counter: Optional[metrics.Counter] = None
 _duration_hist: Optional[metrics.Histogram] = None
+_request_counter: Optional[metrics.Counter] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _tracer, _token_counter, _duration_hist
+    global _tracer, _token_counter, _duration_hist, _request_counter
 
     from otel import setup_telemetry
 
@@ -49,6 +51,11 @@ async def lifespan(app: FastAPI):
         "gen_ai.request.duration",
         unit="ms",
         description="End-to-end LLM request duration",
+    )
+    _request_counter = meter.create_counter(
+        "gen_ai.requests",
+        unit="requests",
+        description="Total LLM chat requests",
     )
 
     model = os.getenv("LLM_MODEL", "llama3.2")
@@ -75,6 +82,7 @@ class ChatResponse(BaseModel):
     input_tokens: int
     output_tokens: int
     latency_ms: float
+    session_id: str
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -90,67 +98,97 @@ def health():
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+def chat(req: ChatRequest, http_req: Request):
     model = os.getenv("LLM_MODEL", "llama3.2")
 
-    with _tracer.start_as_current_span("gen_ai.chat") as span:
-        # GenAI semantic conventions (OTel spec)
-        span.set_attribute("gen_ai.system", "ollama")
-        span.set_attribute("gen_ai.operation.name", "chat")
-        span.set_attribute("gen_ai.request.model", model)
+    # ── Baggage: carry session identity through the entire request context ──
+    session_id = http_req.headers.get("X-Session-ID") or str(uuid.uuid4())
+    environment = os.getenv("ENVIRONMENT", "local")
 
-        attrs = {"gen_ai.system": "ollama", "gen_ai.request.model": model}
-        t0 = time.perf_counter()
+    ctx = baggage.set_baggage("session.id", session_id)
+    ctx = baggage.set_baggage("model", model, context=ctx)
+    ctx = baggage.set_baggage("environment", environment, context=ctx)
+    token = context.attach(ctx)
 
-        try:
-            messages = [{"role": "user", "content": req.message}]
-            if req.system:
-                messages.insert(0, {"role": "system", "content": req.system})
+    attrs = {"gen_ai.system": "ollama", "gen_ai.request.model": model}
 
-            raw = requests.post(
-                f"{_OLLAMA_HOST}/api/chat",
-                json={"model": model, "messages": messages, "stream": False},
-                timeout=120,
-            )
-            raw.raise_for_status()
-            data = raw.json()
-            latency_ms = (time.perf_counter() - t0) * 1000
+    try:
+        with _tracer.start_as_current_span("gen_ai.chat") as span:
+            # GenAI semantic conventions
+            span.set_attribute("gen_ai.system", "ollama")
+            span.set_attribute("gen_ai.operation.name", "chat")
+            span.set_attribute("gen_ai.request.model", model)
 
-            input_tokens = data.get("prompt_eval_count") or 0
-            output_tokens = data.get("eval_count") or 0
+            # Expose baggage values as span attributes for easy querying in Dash0
+            span.set_attribute("session.id", session_id)
+            span.set_attribute("deployment.environment", environment)
 
-            # Record response attributes
-            span.set_attribute("gen_ai.response.model", model)
-            span.set_attribute("gen_ai.response.finish_reason", data.get("done_reason", "stop"))
-            span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-            span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
-
-            # Metrics
-            if input_tokens:
-                _token_counter.add(input_tokens, {**attrs, "gen_ai.token.type": "input"})
-            _token_counter.add(output_tokens, {**attrs, "gen_ai.token.type": "output"})
-            _duration_hist.record(latency_ms, attrs)
+            t0 = time.perf_counter()
 
             logger.info(
-                "chat ok model=%s in=%d out=%d latency_ms=%.0f",
-                model, input_tokens, output_tokens, latency_ms,
+                "chat request started session=%s model=%s prompt_len=%d",
+                session_id, model, len(req.message),
             )
 
-            return ChatResponse(
-                response=data["message"]["content"],
-                model=model,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                latency_ms=round(latency_ms, 1),
-            )
+            try:
+                messages = [{"role": "user", "content": req.message}]
+                if req.system:
+                    messages.insert(0, {"role": "system", "content": req.system})
 
-        except Exception as exc:
-            latency_ms = (time.perf_counter() - t0) * 1000
-            span.record_exception(exc)
-            span.set_attribute("error.type", type(exc).__name__)
-            _duration_hist.record(latency_ms, {**attrs, "error": "true"})
-            logger.error("chat failed: %s", exc)
-            raise HTTPException(status_code=502, detail=str(exc))
+                raw = requests.post(
+                    f"{_OLLAMA_HOST}/api/chat",
+                    json={"model": model, "messages": messages, "stream": False},
+                    timeout=120,
+                )
+                raw.raise_for_status()
+                data = raw.json()
+                latency_ms = (time.perf_counter() - t0) * 1000
+
+                input_tokens = data.get("prompt_eval_count") or 0
+                output_tokens = data.get("eval_count") or 0
+
+                # Trace attributes
+                span.set_attribute("gen_ai.response.model", model)
+                span.set_attribute("gen_ai.response.finish_reason", data.get("done_reason", "stop"))
+                span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+                span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+
+                # Metrics
+                _request_counter.add(1, {**attrs, "status": "ok"})
+                if input_tokens:
+                    _token_counter.add(input_tokens, {**attrs, "gen_ai.token.type": "input"})
+                _token_counter.add(output_tokens, {**attrs, "gen_ai.token.type": "output"})
+                _duration_hist.record(latency_ms, attrs)
+
+                # Structured log — trace_id/span_id are injected automatically by OTel
+                logger.info(
+                    "chat ok session=%s model=%s in=%d out=%d latency_ms=%.0f",
+                    session_id, model, input_tokens, output_tokens, latency_ms,
+                )
+
+                return ChatResponse(
+                    response=data["message"]["content"],
+                    model=model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    latency_ms=round(latency_ms, 1),
+                    session_id=session_id,
+                )
+
+            except Exception as exc:
+                latency_ms = (time.perf_counter() - t0) * 1000
+                span.record_exception(exc)
+                span.set_attribute("error.type", type(exc).__name__)
+                _request_counter.add(1, {**attrs, "status": "error"})
+                _duration_hist.record(latency_ms, {**attrs, "error": "true"})
+                logger.error(
+                    "chat failed session=%s model=%s error=%s",
+                    session_id, model, exc,
+                )
+                raise HTTPException(status_code=502, detail=str(exc))
+
+    finally:
+        context.detach(token)
 
 
 # ── Embedded chat UI ─────────────────────────────────────────────────────────
@@ -164,10 +202,11 @@ _HTML_PAGE = """<!DOCTYPE html>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: system-ui, -apple-system, sans-serif; background: #0f1117; color: #e2e8f0; height: 100vh; display: flex; flex-direction: column; align-items: center; }
-header { width: 100%; max-width: 800px; padding: 18px 20px; border-bottom: 1px solid #1e2a3a; display: flex; align-items: center; gap: 12px; }
+header { width: 100%; max-width: 800px; padding: 18px 20px; border-bottom: 1px solid #1e2a3a; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 header h1 { font-size: 1.1rem; font-weight: 600; }
 .badge { background: #0f62fe; color: white; font-size: 0.68rem; padding: 3px 9px; border-radius: 999px; letter-spacing: .02em; }
 .badge.local { background: #059669; }
+.badge.session { background: #7c3aed; font-family: monospace; }
 #chat { flex: 1; width: 100%; max-width: 800px; overflow-y: auto; padding: 24px 20px; display: flex; flex-direction: column; gap: 16px; }
 .msg { max-width: 82%; padding: 12px 16px; border-radius: 14px; line-height: 1.55; word-break: break-word; }
 .user { align-self: flex-end; background: #0f62fe; color: white; border-bottom-right-radius: 4px; }
@@ -187,13 +226,16 @@ button:disabled { opacity: 0.4; cursor: default; }
 <header>
   <h1>🤖 LLM Demo</h1>
   <span class="badge local">Local · Ollama</span>
-  <span class="badge">OpenTelemetry</span>
-  <span class="badge">Dash0</span>
+  <span class="badge">Traces</span>
+  <span class="badge">Metrics</span>
+  <span class="badge">Logs</span>
+  <span class="badge">Baggage</span>
+  <span class="badge session" id="session-badge">session: …</span>
 </header>
 <div id="chat">
   <div class="msg assistant">
-    👋 Hi! I'm running locally via Ollama — <strong>no API costs</strong>. Every message creates an <strong>OpenTelemetry trace</strong> with LLM attributes visible in Dash0.
-    <div class="meta">Traces include model, token counts, and latency · 100% local inference</div>
+    👋 Hi! I'm running locally via Ollama — <strong>no API costs</strong>. Every message creates an <strong>OpenTelemetry trace</strong> with correlated logs, metrics, and baggage — all visible in Dash0.
+    <div class="meta">Traces · Metrics · Logs · Baggage · 100% local inference</div>
   </div>
 </div>
 <footer>
@@ -204,6 +246,14 @@ button:disabled { opacity: 0.4; cursor: default; }
 const chat = document.getElementById('chat');
 const input = document.getElementById('input');
 const btn = document.getElementById('btn');
+
+// Persist session ID across page refreshes so all messages share the same baggage
+let sessionId = localStorage.getItem('llm_session_id');
+if (!sessionId) {
+  sessionId = crypto.randomUUID();
+  localStorage.setItem('llm_session_id', sessionId);
+}
+document.getElementById('session-badge').textContent = 'session: ' + sessionId.slice(0, 8) + '…';
 
 input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
 
@@ -228,7 +278,10 @@ async function send() {
   try {
     const res = await fetch('/api/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Session-ID': sessionId,
+      },
       body: JSON.stringify({ message: msg }),
     });
     const data = await res.json();
@@ -236,7 +289,7 @@ async function send() {
 
     pending.querySelector('div').innerHTML = escHtml(data.response).replace(/\\n/g, '<br>');
     pending.querySelector('.meta').textContent =
-      `${data.model} · ${data.input_tokens} in / ${data.output_tokens} out · ${data.latency_ms}ms`;
+      `${data.model} · ${data.input_tokens} in / ${data.output_tokens} out · ${data.latency_ms}ms · session: ${data.session_id.slice(0,8)}…`;
   } catch (err) {
     pending.querySelector('div').innerHTML = `<span style="color:#f87171">Error: ${escHtml(err.message)}</span>`;
     pending.querySelector('.meta').textContent = '';
