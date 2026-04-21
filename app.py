@@ -17,7 +17,9 @@ import random
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
+
+import httpx
 
 _SYNTHETIC_PROMPTS = [
     "What is observability in software engineering?",
@@ -59,6 +61,20 @@ def _broadcast(event: dict) -> None:
     payload = f"data: {json.dumps(event)}\n\n"
     for q in _feed_subscribers:
         q.put_nowait(payload)
+
+
+_PROCESSOR_URL = os.getenv("PROCESSOR_URL", "http://localhost:8001")
+
+
+def _processor(path: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Call the processor service — httpx is auto-instrumented, W3C context propagates."""
+    try:
+        resp = httpx.post(f"{_PROCESSOR_URL}{path}", json=body, timeout=5)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        logger.warning("processor %s failed: %s — skipping", path, exc)
+        return body  # degrade gracefully
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -150,14 +166,20 @@ async def _synthetic_traffic_loop():
                                     "latency_ms": round(latency_ms, 1)})
                         continue
 
+                    pre = _processor("/pre", {"prompt": prompt, "session_id": "synthetic"})
+                    clean_prompt = pre.get("prompt", prompt)
+
                     response = _llm_client.chat.completions.create(
                         model=model,
-                        messages=[{"role": "user", "content": prompt}],
+                        messages=[{"role": "user", "content": clean_prompt}],
                     )
                     latency_ms = (time.perf_counter() - t0) * 1000
 
                     input_tokens = response.usage.prompt_tokens if response.usage else 0
                     output_tokens = response.usage.completion_tokens if response.usage else 0
+                    raw_content = response.choices[0].message.content or ""
+
+                    post = _processor("/post", {"response": raw_content, "session_id": "synthetic"})
 
                     _request_counter.add(1, {**attrs, "status": "ok"})
                     if input_tokens:
@@ -165,19 +187,20 @@ async def _synthetic_traffic_loop():
                     _token_counter.add(output_tokens, {**attrs, "gen_ai.token.type": "output"})
                     _duration_hist.record(latency_ms, attrs)
 
-                    content = response.choices[0].message.content or ""
                     logger.info(
-                        "synthetic traffic ok in=%d out=%d latency_ms=%.0f",
-                        input_tokens, output_tokens, latency_ms,
+                        "synthetic traffic ok in=%d out=%d latency_ms=%.0f sentiment=%s",
+                        input_tokens, output_tokens, latency_ms, post.get("sentiment", "?"),
                     )
 
                     _broadcast({
                         "prompt": prompt,
-                        "response": content,
+                        "response": raw_content,
                         "model": model,
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
                         "latency_ms": round(latency_ms, 1),
+                        "sentiment": post.get("sentiment", ""),
+                        "reading_time_s": post.get("reading_time_s", 0),
                     })
             finally:
                 context.detach(tok)
@@ -268,12 +291,15 @@ def chat(req: ChatRequest, http_req: Request):
             )
 
             try:
-                messages = [{"role": "user", "content": req.message}]
+                # ── Pre-process: sanitise + enrich prompt ─────────────────
+                pre = _processor("/pre", {"prompt": req.message, "session_id": session_id})
+                clean_prompt = pre.get("prompt", req.message)
+
+                messages = [{"role": "user", "content": clean_prompt}]
                 if req.system:
                     messages.insert(0, {"role": "system", "content": req.system})
 
-                # LLMetry automatically creates a child span for this call with
-                # full GenAI semantic convention attributes (model, tokens, prompts, etc.)
+                # LLMetry automatically creates a child span with GenAI attributes
                 response = _llm_client.chat.completions.create(
                     model=model,
                     messages=messages,
@@ -282,7 +308,13 @@ def chat(req: ChatRequest, http_req: Request):
 
                 input_tokens = response.usage.prompt_tokens if response.usage else 0
                 output_tokens = response.usage.completion_tokens if response.usage else 0
-                content = response.choices[0].message.content or ""
+                raw_content = response.choices[0].message.content or ""
+
+                # ── Post-process: enrich response with metadata ───────────
+                post = _processor("/post", {"response": raw_content, "session_id": session_id})
+                content = post.get("response", raw_content)
+                span.set_attribute("response.sentiment", post.get("sentiment", "unknown"))
+                span.set_attribute("response.reading_time_s", post.get("reading_time_s", 0))
 
                 # Metrics
                 _request_counter.add(1, {**attrs, "status": "ok"})
@@ -292,8 +324,9 @@ def chat(req: ChatRequest, http_req: Request):
                 _duration_hist.record(latency_ms, attrs)
 
                 logger.info(
-                    "chat ok session=%s model=%s in=%d out=%d latency_ms=%.0f",
+                    "chat ok session=%s model=%s in=%d out=%d latency_ms=%.0f sentiment=%s",
                     session_id, model, input_tokens, output_tokens, latency_ms,
+                    post.get("sentiment", "?"),
                 )
 
                 return ChatResponse(
@@ -401,8 +434,10 @@ evtSource.onmessage = (e) => {
       `<span style="color:#f87171">⚠ ${escHtml(d.error_type)}: ${escHtml(d.error)}</span>`,
       `error · ${d.latency_ms}ms · synthetic`);
   } else {
-    addMsg('synthetic-a', escHtml(d.response).replace(/\\n/g, '<br>'),
-      `${d.model} · ${d.input_tokens} in / ${d.output_tokens} out · ${d.latency_ms}ms · synthetic`);
+    const meta = `${d.model} · ${d.input_tokens} in / ${d.output_tokens} out · ${d.latency_ms}ms` +
+      (d.sentiment ? ` · ${d.sentiment}` : '') +
+      (d.reading_time_s ? ` · ${d.reading_time_s}s read` : '') + ' · synthetic';
+    addMsg('synthetic-a', escHtml(d.response).replace(/\\n/g, '<br>'), meta);
   }
 };
 
@@ -457,5 +492,17 @@ function escHtml(s) {
 
 
 if __name__ == "__main__":
+    import subprocess
+    import sys
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    from pathlib import Path
+
+    processor_proc = subprocess.Popen(
+        [sys.executable, str(Path(__file__).parent / "processor.py")],
+        env=os.environ.copy(),
+    )
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    finally:
+        processor_proc.terminate()
+        processor_proc.wait()

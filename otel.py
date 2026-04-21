@@ -9,6 +9,7 @@ import os
 from opentelemetry import metrics, trace
 from opentelemetry._logs import set_logger_provider
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from opentelemetry.instrumentation.logging import LoggingInstrumentor
 from opentelemetry.instrumentation.openai import OpenAIInstrumentor
 from opentelemetry.sdk._logs import LoggerProvider
@@ -25,14 +26,14 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExport
 logger = logging.getLogger(__name__)
 
 
-def setup_telemetry(app=None) -> None:
+def setup_telemetry(app=None, service_name: str = None) -> None:
     endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "").rstrip("/")
     auth_token = os.getenv("DASH0_AUTH_TOKEN", "")
 
     resource = Resource.create(
         {
-            "service.name": os.getenv("OTEL_SERVICE_NAME", "llm-demo"),
-            "service.version": "3.0.0",
+            "service.name": service_name or os.getenv("OTEL_SERVICE_NAME", "llm-demo"),
+            "service.version": "5.0.0",
             "deployment.environment": os.getenv("ENVIRONMENT", "local"),
         }
     )
@@ -87,8 +88,10 @@ def setup_telemetry(app=None) -> None:
     LoggingInstrumentor().instrument(set_logging_format=True, log_level=logging.INFO)
 
     # ── LLMetry — auto-instrument OpenAI SDK calls ───────────────────────────
-    # Captures prompts, completions, token counts, model name automatically
     OpenAIInstrumentor().instrument(capture_message_content=True)
+
+    # ── Auto-instrument outbound httpx calls (propagates W3C trace context) ──
+    HTTPXClientInstrumentor().instrument()
 
     # ── Auto-instrument FastAPI HTTP layer ───────────────────────────────────
     if app is not None:
