@@ -81,7 +81,8 @@ def health():
 @app.post("/pre", response_model=PreResponse)
 def pre_process(req: PreRequest):
     """Sanitise and enrich the user prompt before it reaches the LLM."""
-    with _tracer.start_as_current_span("processor.pre") as span:
+    with _tracer.start_as_current_span("processor.pre", kind=trace.SpanKind.SERVER) as span:
+        span.set_attribute("peer.service", "llm-demo")
         span.set_attribute("session.id", req.session_id)
 
         # Sanitise: collapse whitespace, strip control characters
@@ -111,7 +112,8 @@ def pre_process(req: PreRequest):
 @app.post("/post", response_model=PostResponse)
 def post_process(req: PostRequest):
     """Enrich the LLM response with metadata before returning it to the user."""
-    with _tracer.start_as_current_span("processor.post") as span:
+    with _tracer.start_as_current_span("processor.post", kind=trace.SpanKind.SERVER) as span:
+        span.set_attribute("peer.service", "llm-demo")
         span.set_attribute("session.id", req.session_id)
 
         words = req.response.split()

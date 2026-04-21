@@ -67,14 +67,23 @@ _PROCESSOR_URL = os.getenv("PROCESSOR_URL", "http://localhost:8001")
 
 
 def _processor(path: str, body: dict[str, Any]) -> dict[str, Any]:
-    """Call the processor service — httpx is auto-instrumented, W3C context propagates."""
-    try:
-        resp = httpx.post(f"{_PROCESSOR_URL}{path}", json=body, timeout=5)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as exc:
-        logger.warning("processor %s failed: %s — skipping", path, exc)
-        return body  # degrade gracefully
+    """Call the processor service with an explicit span so Dash0 can build the dependency edge."""
+    with _tracer.start_as_current_span(
+        f"processor{path}",
+        kind=trace.SpanKind.CLIENT,
+        attributes={
+            "peer.service": "llm-processor",
+            "http.method": "POST",
+            "http.url": f"{_PROCESSOR_URL}{path}",
+        },
+    ):
+        try:
+            resp = httpx.post(f"{_PROCESSOR_URL}{path}", json=body, timeout=5)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            logger.warning("processor %s failed: %s — skipping", path, exc)
+            return body  # degrade gracefully
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
