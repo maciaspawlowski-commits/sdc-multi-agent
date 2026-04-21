@@ -22,14 +22,24 @@ from typing import Any, Optional
 import httpx
 
 _SYNTHETIC_PROMPTS = [
-    "What is observability in software engineering?",
-    "Explain distributed tracing in one sentence.",
-    "What are the three pillars of observability?",
-    "How do metrics differ from logs?",
-    "What is OpenTelemetry and why does it matter?",
-    "Give me a one-line definition of a service mesh.",
-    "What is the purpose of a span in distributed tracing?",
-    "How does baggage propagation work in OpenTelemetry?",
+    "What are the trade-offs between head-based and tail-based trace sampling strategies in high-throughput distributed systems?",
+    "How does the OpenTelemetry Collector's processor pipeline differ from SDK-side processing, and when should you prefer each?",
+    "Explain how exemplars bridge the gap between metrics and traces in Prometheus and OpenTelemetry.",
+    "What are the cardinality pitfalls when designing metric label sets, and how do they affect TSDB performance?",
+    "How does W3C Trace Context propagation differ from B3 propagation, and what are the migration risks?",
+    "When should you use a histogram vs a summary metric, and what are the aggregation semantics differences in OpenTelemetry?",
+    "Describe the cold-start observability problem in serverless and how OTel instrumentation needs to adapt.",
+    "What is the difference between push-based and pull-based metrics collection, and how does the OTel Collector bridge both?",
+    "How do you design a meaningful SLO using error budget burn rate alerts without generating alert fatigue?",
+    "What are the observability implications of eventual consistency in distributed datastores, and how do you trace across async boundaries?",
+    "Compare RED, USE, and GOLDEN SIGNALS methodologies — when would you apply each in an LLM serving platform?",
+    "How does context propagation work across message queue boundaries in async architectures, and what OTel conventions apply?",
+    "What are the semantic conventions for GenAI observability in OpenTelemetry, and how mature is the spec today?",
+    "Explain the differences between span events, span links, and child spans — when is each the right modelling choice?",
+    "How do you instrument a streaming LLM response (server-sent events) with OpenTelemetry without losing token-level telemetry?",
+    "What is the role of the Resource in OTel, and how does it differ from span attributes for infrastructure correlation?",
+    "How do you detect and alert on LLM prompt injection attempts using observability data alone?",
+    "What are the observability challenges of multi-tenant LLM deployments, and how do you isolate per-tenant signals?",
 ]
 
 _SYNTHETIC_ERRORS = [
