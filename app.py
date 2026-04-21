@@ -49,7 +49,7 @@ from asyncio import Queue
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
-from openai import AsyncOpenAI
+from openai import OpenAI
 from opentelemetry import baggage, context, metrics, trace
 from pydantic import BaseModel
 
@@ -97,8 +97,8 @@ _token_counter: Optional[metrics.Counter] = None
 _duration_hist: Optional[metrics.Histogram] = None
 _request_counter: Optional[metrics.Counter] = None
 
-# Async OpenAI client — allows true concurrent LLM requests on one event loop
-_llm_client: Optional[AsyncOpenAI] = None
+# Sync OpenAI client — LLMetry instruments this; calls run via asyncio.to_thread for concurrency
+_llm_client: Optional[OpenAI] = None
 
 
 @asynccontextmanager
@@ -127,7 +127,7 @@ async def lifespan(app: FastAPI):
     )
 
     ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-    _llm_client = AsyncOpenAI(
+    _llm_client = OpenAI(
         base_url=f"{ollama_host}/v1",
         api_key="ollama",  # required by the SDK, ignored by Ollama
     )
@@ -179,7 +179,7 @@ async def _synthetic_traffic_loop():
                     pre = await _processor("/pre", {"prompt": prompt, "session_id": "synthetic"})
                     clean_prompt = pre.get("prompt", prompt)
 
-                    response = await _llm_client.chat.completions.create(
+                    response = await asyncio.to_thread(_llm_client.chat.completions.create,
                         model=model,
                         messages=[{"role": "user", "content": clean_prompt}],
                     )
@@ -310,7 +310,8 @@ async def chat(req: ChatRequest, http_req: Request):
                     messages.insert(0, {"role": "system", "content": req.system})
 
                 # LLMetry automatically creates a child span with GenAI attributes
-                response = _llm_client.chat.completions.create(
+                response = await asyncio.to_thread(
+                    _llm_client.chat.completions.create,
                     model=model,
                     messages=messages,
                 )
