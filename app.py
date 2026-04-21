@@ -41,6 +41,7 @@ _SYNTHETIC_ERRORS = [
 ]
 
 _ERROR_RATE = float(os.getenv("SYNTHETIC_ERROR_RATE", "0.2"))  # 20% chance of error
+APP_VERSION = os.getenv("APP_VERSION", "6.0.0")
 
 _SYNTHETIC_INTERVAL = int(os.getenv("SYNTHETIC_INTERVAL_SECONDS", "5"))
 
@@ -106,7 +107,7 @@ async def lifespan(app: FastAPI):
     global _tracer, _token_counter, _duration_hist, _request_counter, _llm_client
 
     from otel import setup_telemetry
-    setup_telemetry(app)
+    setup_telemetry(app, service_version=APP_VERSION)
 
     _tracer = trace.get_tracer("llm-demo")
     meter = metrics.get_meter("llm-demo")
@@ -246,7 +247,7 @@ class ChatResponse(BaseModel):
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def ui():
-    return _HTML_PAGE
+    return _HTML_PAGE.replace("__APP_VERSION__", APP_VERSION)
 
 
 @app.get("/health")
@@ -379,6 +380,7 @@ body { font-family: system-ui, -apple-system, sans-serif; background: #0f1117; c
 header { width: 100%; max-width: 800px; padding: 18px 20px; border-bottom: 1px solid #1e2a3a; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 header h1 { font-size: 1.1rem; font-weight: 600; }
 .badge { background: #0f62fe; color: white; font-size: 0.68rem; padding: 3px 9px; border-radius: 999px; letter-spacing: .02em; }
+.badge.version { background: #374151; font-family: monospace; }
 .badge.local { background: #059669; }
 .badge.llmetry { background: #d97706; }
 .badge.session { background: #7c3aed; font-family: monospace; }
@@ -402,6 +404,7 @@ button:disabled { opacity: 0.4; cursor: default; }
 <body>
 <header>
   <h1>🤖 LLM Demo</h1>
+  <span class="badge version">v__APP_VERSION__</span>
   <span class="badge local">Local · Ollama</span>
   <span class="badge llmetry">LLMetry</span>
   <span class="badge">Traces</span>

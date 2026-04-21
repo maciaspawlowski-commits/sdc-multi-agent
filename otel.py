@@ -26,14 +26,14 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExport
 logger = logging.getLogger(__name__)
 
 
-def setup_telemetry(app=None, service_name: str = None) -> None:
+def setup_telemetry(app=None, service_name: str = None, service_version: str = None) -> None:
     endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "").rstrip("/")
     auth_token = os.getenv("DASH0_AUTH_TOKEN", "")
 
     resource = Resource.create(
         {
             "service.name": service_name or os.getenv("OTEL_SERVICE_NAME", "llm-demo"),
-            "service.version": "5.0.0",
+            "service.version": service_version or os.getenv("APP_VERSION", "6.0.0"),
             "deployment.environment": os.getenv("ENVIRONMENT", "local"),
         }
     )
