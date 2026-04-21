@@ -49,7 +49,7 @@ from asyncio import Queue
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
-from openai import OpenAI
+from openai import AsyncOpenAI
 from opentelemetry import baggage, context, metrics, trace
 from pydantic import BaseModel
 
@@ -66,8 +66,8 @@ def _broadcast(event: dict) -> None:
 _PROCESSOR_URL = os.getenv("PROCESSOR_URL", "http://localhost:8001")
 
 
-def _processor(path: str, body: dict[str, Any]) -> dict[str, Any]:
-    """Call the processor service with an explicit span so Dash0 can build the dependency edge."""
+async def _processor(path: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Call the processor service — fully async so it never blocks the event loop."""
     with _tracer.start_as_current_span(
         f"processor{path}",
         kind=trace.SpanKind.CLIENT,
@@ -78,7 +78,8 @@ def _processor(path: str, body: dict[str, Any]) -> dict[str, Any]:
         },
     ):
         try:
-            resp = httpx.post(f"{_PROCESSOR_URL}{path}", json=body, timeout=5)
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(f"{_PROCESSOR_URL}{path}", json=body, timeout=5)
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:
@@ -96,8 +97,8 @@ _token_counter: Optional[metrics.Counter] = None
 _duration_hist: Optional[metrics.Histogram] = None
 _request_counter: Optional[metrics.Counter] = None
 
-# OpenAI client pointing at Ollama's OpenAI-compatible endpoint
-_llm_client: Optional[OpenAI] = None
+# Async OpenAI client — allows true concurrent LLM requests on one event loop
+_llm_client: Optional[AsyncOpenAI] = None
 
 
 @asynccontextmanager
@@ -126,7 +127,7 @@ async def lifespan(app: FastAPI):
     )
 
     ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-    _llm_client = OpenAI(
+    _llm_client = AsyncOpenAI(
         base_url=f"{ollama_host}/v1",
         api_key="ollama",  # required by the SDK, ignored by Ollama
     )
@@ -175,10 +176,10 @@ async def _synthetic_traffic_loop():
                                     "latency_ms": round(latency_ms, 1)})
                         continue
 
-                    pre = _processor("/pre", {"prompt": prompt, "session_id": "synthetic"})
+                    pre = await _processor("/pre", {"prompt": prompt, "session_id": "synthetic"})
                     clean_prompt = pre.get("prompt", prompt)
 
-                    response = _llm_client.chat.completions.create(
+                    response = await _llm_client.chat.completions.create(
                         model=model,
                         messages=[{"role": "user", "content": clean_prompt}],
                     )
@@ -188,7 +189,7 @@ async def _synthetic_traffic_loop():
                     output_tokens = response.usage.completion_tokens if response.usage else 0
                     raw_content = response.choices[0].message.content or ""
 
-                    post = _processor("/post", {"response": raw_content, "session_id": "synthetic"})
+                    post = await _processor("/post", {"response": raw_content, "session_id": "synthetic"})
 
                     _request_counter.add(1, {**attrs, "status": "ok"})
                     if input_tokens:
@@ -272,7 +273,7 @@ async def feed():
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-def chat(req: ChatRequest, http_req: Request):
+async def chat(req: ChatRequest, http_req: Request):
     model = os.getenv("LLM_MODEL", "llama3.2")
 
     # ── Baggage: carry session identity through the entire request context ──
@@ -301,7 +302,7 @@ def chat(req: ChatRequest, http_req: Request):
 
             try:
                 # ── Pre-process: sanitise + enrich prompt ─────────────────
-                pre = _processor("/pre", {"prompt": req.message, "session_id": session_id})
+                pre = await _processor("/pre", {"prompt": req.message, "session_id": session_id})
                 clean_prompt = pre.get("prompt", req.message)
 
                 messages = [{"role": "user", "content": clean_prompt}]
@@ -320,7 +321,7 @@ def chat(req: ChatRequest, http_req: Request):
                 raw_content = response.choices[0].message.content or ""
 
                 # ── Post-process: enrich response with metadata ───────────
-                post = _processor("/post", {"response": raw_content, "session_id": session_id})
+                post = await _processor("/post", {"response": raw_content, "session_id": session_id})
                 content = post.get("response", raw_content)
                 span.set_attribute("response.sentiment", post.get("sentiment", "unknown"))
                 span.set_attribute("response.reading_time_s", post.get("reading_time_s", 0))
@@ -461,35 +462,30 @@ function addMsg(role, html, meta) {
 
 async function send() {
   const msg = input.value.trim();
-  if (!msg || btn.disabled) return;
+  if (!msg) return;
 
   input.value = '';
-  btn.disabled = true;
+  input.focus();
   addMsg('user', escHtml(msg));
   const pending = addMsg('assistant', '<span class="thinking">Thinking…</span>', '');
 
-  try {
-    const res = await fetch('/api/chat', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Session-ID': sessionId,
-      },
-      body: JSON.stringify({ message: msg }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Request failed');
-
+  // fire-and-forget — no lock, multiple requests can be in-flight simultaneously
+  fetch('/api/chat', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Session-ID': sessionId,
+    },
+    body: JSON.stringify({ message: msg }),
+  }).then(res => res.json().then(data => ({ ok: res.ok, data }))).then(({ ok, data }) => {
+    if (!ok) throw new Error(data.detail || 'Request failed');
     pending.querySelector('div').innerHTML = escHtml(data.response).replace(/\\n/g, '<br>');
     pending.querySelector('.meta').textContent =
       `${data.model} · ${data.input_tokens} in / ${data.output_tokens} out · ${data.latency_ms}ms · session: ${data.session_id.slice(0,8)}…`;
-  } catch (err) {
+  }).catch(err => {
     pending.querySelector('div').innerHTML = `<span style="color:#f87171">Error: ${escHtml(err.message)}</span>`;
     pending.querySelector('.meta').textContent = '';
-  }
-
-  btn.disabled = false;
-  input.focus();
+  });
 }
 
 function escHtml(s) {
