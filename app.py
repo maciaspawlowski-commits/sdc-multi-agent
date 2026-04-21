@@ -30,6 +30,16 @@ _SYNTHETIC_PROMPTS = [
     "How does baggage propagation work in OpenTelemetry?",
 ]
 
+_SYNTHETIC_ERRORS = [
+    ("TimeoutError", "LLM request timed out after 30s"),
+    ("ConnectionError", "Failed to connect to model backend"),
+    ("RateLimitError", "Rate limit exceeded — too many requests"),
+    ("ModelUnavailableError", "Requested model is not available"),
+    ("ContextLengthError", "Prompt exceeds maximum context length"),
+]
+
+_ERROR_RATE = float(os.getenv("SYNTHETIC_ERROR_RATE", "0.2"))  # 20% chance of error
+
 _SYNTHETIC_INTERVAL = int(os.getenv("SYNTHETIC_INTERVAL_SECONDS", "5"))
 
 import json
@@ -126,6 +136,19 @@ async def _synthetic_traffic_loop():
 
                     t0 = time.perf_counter()
                     logger.info("synthetic traffic: prompt=%r", prompt[:60])
+
+                    # Simulate random errors (~20% of requests)
+                    if random.random() < _ERROR_RATE:
+                        err_type, err_msg = random.choice(_SYNTHETIC_ERRORS)
+                        latency_ms = (time.perf_counter() - t0) * 1000 + random.uniform(50, 800)
+                        span.set_attribute("error.type", err_type)
+                        span.record_exception(Exception(err_msg))
+                        _request_counter.add(1, {**attrs, "status": "error"})
+                        _duration_hist.record(latency_ms, {**attrs, "error": "true"})
+                        logger.error("synthetic error type=%s msg=%s", err_type, err_msg)
+                        _broadcast({"prompt": prompt, "error": err_msg, "error_type": err_type,
+                                    "latency_ms": round(latency_ms, 1)})
+                        continue
 
                     response = _llm_client.chat.completions.create(
                         model=model,
@@ -373,8 +396,14 @@ const evtSource = new EventSource('/api/feed');
 evtSource.onmessage = (e) => {
   const d = JSON.parse(e.data);
   addMsg('synthetic-q', '🤖 <em>[synthetic]</em> ' + escHtml(d.prompt));
-  addMsg('synthetic-a', escHtml(d.response).replace(/\\n/g, '<br>'),
-    `${d.model} · ${d.input_tokens} in / ${d.output_tokens} out · ${d.latency_ms}ms · synthetic`);
+  if (d.error) {
+    addMsg('synthetic-a',
+      `<span style="color:#f87171">⚠ ${escHtml(d.error_type)}: ${escHtml(d.error)}</span>`,
+      `error · ${d.latency_ms}ms · synthetic`);
+  } else {
+    addMsg('synthetic-a', escHtml(d.response).replace(/\\n/g, '<br>'),
+      `${d.model} · ${d.input_tokens} in / ${d.output_tokens} out · ${d.latency_ms}ms · synthetic`);
+  }
 };
 
 function addMsg(role, html, meta) {
