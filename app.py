@@ -1,7 +1,10 @@
-"""Simple LLM chat app — instrumented with OpenTelemetry, monitored by Dash0.
+"""Simple LLM chat app — instrumented with OpenTelemetry + LLMetry, monitored by Dash0.
 
 Uses Ollama for fully local, free inference (no API keys required).
 Install Ollama: https://ollama.com  →  ollama pull llama3.2
+
+LLM calls are auto-instrumented via LLMetry (Traceloop's opentelemetry-instrumentation-openai).
+The OpenAI SDK is pointed at Ollama's OpenAI-compatible local endpoint — no OpenAI account needed.
 """
 
 from dotenv import load_dotenv
@@ -14,9 +17,9 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
-import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
+from openai import OpenAI
 from opentelemetry import baggage, context, metrics, trace
 from pydantic import BaseModel
 
@@ -31,13 +34,15 @@ _token_counter: Optional[metrics.Counter] = None
 _duration_hist: Optional[metrics.Histogram] = None
 _request_counter: Optional[metrics.Counter] = None
 
+# OpenAI client pointing at Ollama's OpenAI-compatible endpoint
+_llm_client: Optional[OpenAI] = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _tracer, _token_counter, _duration_hist, _request_counter
+    global _tracer, _token_counter, _duration_hist, _request_counter, _llm_client
 
     from otel import setup_telemetry
-
     setup_telemetry(app)
 
     _tracer = trace.get_tracer("llm-demo")
@@ -58,15 +63,19 @@ async def lifespan(app: FastAPI):
         description="Total LLM chat requests",
     )
 
+    ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    _llm_client = OpenAI(
+        base_url=f"{ollama_host}/v1",
+        api_key="ollama",  # required by the SDK, ignored by Ollama
+    )
+
     model = os.getenv("LLM_MODEL", "llama3.2")
-    logger.info("LLM Demo ready — http://localhost:8000  (model: %s)", model)
+    logger.info("LLM Demo ready — http://localhost:8000  (model: %s, via LLMetry)", model)
     yield
     logger.info("LLM Demo shutting down")
 
 
 app = FastAPI(title="LLM Demo · Dash0", lifespan=lifespan)
-
-_OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 
 
 # ── Request / Response models ────────────────────────────────────────────────
@@ -113,15 +122,10 @@ def chat(req: ChatRequest, http_req: Request):
     attrs = {"gen_ai.system": "ollama", "gen_ai.request.model": model}
 
     try:
-        with _tracer.start_as_current_span("gen_ai.chat") as span:
-            # GenAI semantic conventions
-            span.set_attribute("gen_ai.system", "ollama")
-            span.set_attribute("gen_ai.operation.name", "chat")
-            span.set_attribute("gen_ai.request.model", model)
-
-            # Expose baggage values as span attributes for easy querying in Dash0
+        with _tracer.start_as_current_span("llm.chat") as span:
             span.set_attribute("session.id", session_id)
             span.set_attribute("deployment.environment", environment)
+            span.set_attribute("gen_ai.request.model", model)
 
             t0 = time.perf_counter()
 
@@ -135,23 +139,17 @@ def chat(req: ChatRequest, http_req: Request):
                 if req.system:
                     messages.insert(0, {"role": "system", "content": req.system})
 
-                raw = requests.post(
-                    f"{_OLLAMA_HOST}/api/chat",
-                    json={"model": model, "messages": messages, "stream": False},
-                    timeout=120,
+                # LLMetry automatically creates a child span for this call with
+                # full GenAI semantic convention attributes (model, tokens, prompts, etc.)
+                response = _llm_client.chat.completions.create(
+                    model=model,
+                    messages=messages,
                 )
-                raw.raise_for_status()
-                data = raw.json()
                 latency_ms = (time.perf_counter() - t0) * 1000
 
-                input_tokens = data.get("prompt_eval_count") or 0
-                output_tokens = data.get("eval_count") or 0
-
-                # Trace attributes
-                span.set_attribute("gen_ai.response.model", model)
-                span.set_attribute("gen_ai.response.finish_reason", data.get("done_reason", "stop"))
-                span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-                span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+                input_tokens = response.usage.prompt_tokens if response.usage else 0
+                output_tokens = response.usage.completion_tokens if response.usage else 0
+                content = response.choices[0].message.content or ""
 
                 # Metrics
                 _request_counter.add(1, {**attrs, "status": "ok"})
@@ -160,14 +158,13 @@ def chat(req: ChatRequest, http_req: Request):
                 _token_counter.add(output_tokens, {**attrs, "gen_ai.token.type": "output"})
                 _duration_hist.record(latency_ms, attrs)
 
-                # Structured log — trace_id/span_id are injected automatically by OTel
                 logger.info(
                     "chat ok session=%s model=%s in=%d out=%d latency_ms=%.0f",
                     session_id, model, input_tokens, output_tokens, latency_ms,
                 )
 
                 return ChatResponse(
-                    response=data["message"]["content"],
+                    response=content,
                     model=model,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
@@ -206,6 +203,7 @@ header { width: 100%; max-width: 800px; padding: 18px 20px; border-bottom: 1px s
 header h1 { font-size: 1.1rem; font-weight: 600; }
 .badge { background: #0f62fe; color: white; font-size: 0.68rem; padding: 3px 9px; border-radius: 999px; letter-spacing: .02em; }
 .badge.local { background: #059669; }
+.badge.llmetry { background: #d97706; }
 .badge.session { background: #7c3aed; font-family: monospace; }
 #chat { flex: 1; width: 100%; max-width: 800px; overflow-y: auto; padding: 24px 20px; display: flex; flex-direction: column; gap: 16px; }
 .msg { max-width: 82%; padding: 12px 16px; border-radius: 14px; line-height: 1.55; word-break: break-word; }
@@ -226,6 +224,7 @@ button:disabled { opacity: 0.4; cursor: default; }
 <header>
   <h1>🤖 LLM Demo</h1>
   <span class="badge local">Local · Ollama</span>
+  <span class="badge llmetry">LLMetry</span>
   <span class="badge">Traces</span>
   <span class="badge">Metrics</span>
   <span class="badge">Logs</span>
@@ -234,8 +233,8 @@ button:disabled { opacity: 0.4; cursor: default; }
 </header>
 <div id="chat">
   <div class="msg assistant">
-    👋 Hi! I'm running locally via Ollama — <strong>no API costs</strong>. Every message creates an <strong>OpenTelemetry trace</strong> with correlated logs, metrics, and baggage — all visible in Dash0.
-    <div class="meta">Traces · Metrics · Logs · Baggage · 100% local inference</div>
+    👋 Hi! I'm running locally via Ollama — <strong>no API costs</strong>. Every message is auto-instrumented by <strong>LLMetry</strong> and sent to Dash0 as correlated traces, metrics, and logs.
+    <div class="meta">LLMetry · Traces · Metrics · Logs · Baggage · 100% local inference</div>
   </div>
 </div>
 <footer>
@@ -309,5 +308,4 @@ function escHtml(s) {
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

@@ -2,8 +2,11 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 
-# HTTP client for Ollama REST API (no ollama Python lib needed)
-requests>=2.31.0
+# LLM client — points at local Ollama's OpenAI-compatible endpoint
+openai>=1.0.0
+
+# LLMetry — Traceloop's OTel instrumentation for LLM SDKs
+opentelemetry-instrumentation-openai>=0.38.0
 
 # OpenTelemetry core
 opentelemetry-api>=1.27.0
