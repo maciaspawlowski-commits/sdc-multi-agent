@@ -10,12 +10,27 @@ The OpenAI SDK is pointed at Ollama's OpenAI-compatible local endpoint — no Op
 from dotenv import load_dotenv
 load_dotenv()
 
+import asyncio
 import logging
 import os
+import random
 import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
+
+_SYNTHETIC_PROMPTS = [
+    "What is observability in software engineering?",
+    "Explain distributed tracing in one sentence.",
+    "What are the three pillars of observability?",
+    "How do metrics differ from logs?",
+    "What is OpenTelemetry and why does it matter?",
+    "Give me a one-line definition of a service mesh.",
+    "What is the purpose of a span in distributed tracing?",
+    "How does baggage propagation work in OpenTelemetry?",
+]
+
+_SYNTHETIC_INTERVAL = int(os.getenv("SYNTHETIC_INTERVAL_SECONDS", "20"))
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -71,8 +86,63 @@ async def lifespan(app: FastAPI):
 
     model = os.getenv("LLM_MODEL", "llama3.2")
     logger.info("LLM Demo ready — http://localhost:8000  (model: %s, via LLMetry)", model)
+
+    task = asyncio.create_task(_synthetic_traffic_loop())
     yield
+    task.cancel()
     logger.info("LLM Demo shutting down")
+
+
+async def _synthetic_traffic_loop():
+    """Generate periodic LLM requests to keep Dash0 charts and dependency map populated."""
+    await asyncio.sleep(5)  # let startup finish first
+    while True:
+        try:
+            prompt = random.choice(_SYNTHETIC_PROMPTS)
+            model = os.getenv("LLM_MODEL", "llama3.2")
+            attrs = {"gen_ai.system": "ollama", "gen_ai.request.model": model}
+
+            ctx = baggage.set_baggage("session.id", "synthetic")
+            ctx = baggage.set_baggage("traffic.type", "synthetic", context=ctx)
+            tok = context.attach(ctx)
+
+            try:
+                with _tracer.start_as_current_span("llm.chat") as span:
+                    span.set_attribute("session.id", "synthetic")
+                    span.set_attribute("traffic.type", "synthetic")
+                    span.set_attribute("gen_ai.request.model", model)
+
+                    t0 = time.perf_counter()
+                    logger.info("synthetic traffic: prompt=%r", prompt[:60])
+
+                    response = _llm_client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    latency_ms = (time.perf_counter() - t0) * 1000
+
+                    input_tokens = response.usage.prompt_tokens if response.usage else 0
+                    output_tokens = response.usage.completion_tokens if response.usage else 0
+
+                    _request_counter.add(1, {**attrs, "status": "ok"})
+                    if input_tokens:
+                        _token_counter.add(input_tokens, {**attrs, "gen_ai.token.type": "input"})
+                    _token_counter.add(output_tokens, {**attrs, "gen_ai.token.type": "output"})
+                    _duration_hist.record(latency_ms, attrs)
+
+                    logger.info(
+                        "synthetic traffic ok in=%d out=%d latency_ms=%.0f",
+                        input_tokens, output_tokens, latency_ms,
+                    )
+            finally:
+                context.detach(tok)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning("synthetic traffic failed: %s", exc)
+
+        await asyncio.sleep(_SYNTHETIC_INTERVAL)
 
 
 app = FastAPI(title="LLM Demo · Dash0", lifespan=lifespan)
