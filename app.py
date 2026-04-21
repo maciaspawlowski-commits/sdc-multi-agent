@@ -1,0 +1,260 @@
+"""Simple LLM chat app — instrumented with OpenTelemetry, monitored by Dash0.
+
+Uses Ollama for fully local, free inference (no API keys required).
+Install Ollama: https://ollama.com  →  ollama pull llama3.2
+"""
+
+from dotenv import load_dotenv
+load_dotenv()
+
+import logging
+import os
+import time
+from contextlib import asynccontextmanager
+from typing import Optional
+
+import requests
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from opentelemetry import metrics, trace
+from pydantic import BaseModel
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# OTel instruments — populated in lifespan after providers are configured
+_tracer: Optional[trace.Tracer] = None
+_token_counter: Optional[metrics.Counter] = None
+_duration_hist: Optional[metrics.Histogram] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _tracer, _token_counter, _duration_hist
+
+    from otel import setup_telemetry
+
+    setup_telemetry(app)
+
+    _tracer = trace.get_tracer("llm-demo")
+    meter = metrics.get_meter("llm-demo")
+    _token_counter = meter.create_counter(
+        "gen_ai.token.usage",
+        unit="tokens",
+        description="LLM token usage (input + output)",
+    )
+    _duration_hist = meter.create_histogram(
+        "gen_ai.request.duration",
+        unit="ms",
+        description="End-to-end LLM request duration",
+    )
+
+    model = os.getenv("LLM_MODEL", "llama3.2")
+    logger.info("LLM Demo ready — http://localhost:8000  (model: %s)", model)
+    yield
+    logger.info("LLM Demo shutting down")
+
+
+app = FastAPI(title="LLM Demo · Dash0", lifespan=lifespan)
+
+_OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+
+
+# ── Request / Response models ────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    message: str
+    system: Optional[str] = None
+
+
+class ChatResponse(BaseModel):
+    response: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    latency_ms: float
+
+
+# ── Routes ───────────────────────────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def ui():
+    return _HTML_PAGE
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    model = os.getenv("LLM_MODEL", "llama3.2")
+
+    with _tracer.start_as_current_span("gen_ai.chat") as span:
+        # GenAI semantic conventions (OTel spec)
+        span.set_attribute("gen_ai.system", "ollama")
+        span.set_attribute("gen_ai.operation.name", "chat")
+        span.set_attribute("gen_ai.request.model", model)
+
+        attrs = {"gen_ai.system": "ollama", "gen_ai.request.model": model}
+        t0 = time.perf_counter()
+
+        try:
+            messages = [{"role": "user", "content": req.message}]
+            if req.system:
+                messages.insert(0, {"role": "system", "content": req.system})
+
+            raw = requests.post(
+                f"{_OLLAMA_HOST}/api/chat",
+                json={"model": model, "messages": messages, "stream": False},
+                timeout=120,
+            )
+            raw.raise_for_status()
+            data = raw.json()
+            latency_ms = (time.perf_counter() - t0) * 1000
+
+            input_tokens = data.get("prompt_eval_count") or 0
+            output_tokens = data.get("eval_count") or 0
+
+            # Record response attributes
+            span.set_attribute("gen_ai.response.model", model)
+            span.set_attribute("gen_ai.response.finish_reason", data.get("done_reason", "stop"))
+            span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+            span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+
+            # Metrics
+            if input_tokens:
+                _token_counter.add(input_tokens, {**attrs, "gen_ai.token.type": "input"})
+            _token_counter.add(output_tokens, {**attrs, "gen_ai.token.type": "output"})
+            _duration_hist.record(latency_ms, attrs)
+
+            logger.info(
+                "chat ok model=%s in=%d out=%d latency_ms=%.0f",
+                model, input_tokens, output_tokens, latency_ms,
+            )
+
+            return ChatResponse(
+                response=data["message"]["content"],
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                latency_ms=round(latency_ms, 1),
+            )
+
+        except Exception as exc:
+            latency_ms = (time.perf_counter() - t0) * 1000
+            span.record_exception(exc)
+            span.set_attribute("error.type", type(exc).__name__)
+            _duration_hist.record(latency_ms, {**attrs, "error": "true"})
+            logger.error("chat failed: %s", exc)
+            raise HTTPException(status_code=502, detail=str(exc))
+
+
+# ── Embedded chat UI ─────────────────────────────────────────────────────────
+
+_HTML_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM Demo · Dash0 Observability</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, -apple-system, sans-serif; background: #0f1117; color: #e2e8f0; height: 100vh; display: flex; flex-direction: column; align-items: center; }
+header { width: 100%; max-width: 800px; padding: 18px 20px; border-bottom: 1px solid #1e2a3a; display: flex; align-items: center; gap: 12px; }
+header h1 { font-size: 1.1rem; font-weight: 600; }
+.badge { background: #0f62fe; color: white; font-size: 0.68rem; padding: 3px 9px; border-radius: 999px; letter-spacing: .02em; }
+.badge.local { background: #059669; }
+#chat { flex: 1; width: 100%; max-width: 800px; overflow-y: auto; padding: 24px 20px; display: flex; flex-direction: column; gap: 16px; }
+.msg { max-width: 82%; padding: 12px 16px; border-radius: 14px; line-height: 1.55; word-break: break-word; }
+.user { align-self: flex-end; background: #0f62fe; color: white; border-bottom-right-radius: 4px; }
+.assistant { align-self: flex-start; background: #1a2232; border-bottom-left-radius: 4px; }
+.meta { font-size: 0.68rem; opacity: 0.45; margin-top: 7px; font-family: monospace; }
+footer { width: 100%; max-width: 800px; padding: 14px 20px; border-top: 1px solid #1e2a3a; display: flex; gap: 10px; }
+#input { flex: 1; background: #1a2232; border: 1px solid #2d3a4f; border-radius: 10px; padding: 11px 15px; color: #e2e8f0; font-size: 0.95rem; outline: none; transition: border-color .15s; }
+#input:focus { border-color: #0f62fe; }
+button { background: #0f62fe; color: white; border: none; border-radius: 10px; padding: 11px 20px; cursor: pointer; font-size: 0.95rem; font-weight: 500; transition: background .15s; }
+button:hover { background: #0353d9; }
+button:disabled { opacity: 0.4; cursor: default; }
+.thinking { opacity: 0.5; font-style: italic; animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 0%,100%{opacity:.3} 50%{opacity:.7} }
+</style>
+</head>
+<body>
+<header>
+  <h1>🤖 LLM Demo</h1>
+  <span class="badge local">Local · Ollama</span>
+  <span class="badge">OpenTelemetry</span>
+  <span class="badge">Dash0</span>
+</header>
+<div id="chat">
+  <div class="msg assistant">
+    👋 Hi! I'm running locally via Ollama — <strong>no API costs</strong>. Every message creates an <strong>OpenTelemetry trace</strong> with LLM attributes visible in Dash0.
+    <div class="meta">Traces include model, token counts, and latency · 100% local inference</div>
+  </div>
+</div>
+<footer>
+  <input id="input" type="text" placeholder="Ask me anything… (runs locally)" autofocus autocomplete="off">
+  <button id="btn" onclick="send()">Send</button>
+</footer>
+<script>
+const chat = document.getElementById('chat');
+const input = document.getElementById('input');
+const btn = document.getElementById('btn');
+
+input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+
+function addMsg(role, html, meta) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.innerHTML = `<div>${html}</div>` + (meta !== undefined ? `<div class="meta">${meta}</div>` : '');
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return div;
+}
+
+async function send() {
+  const msg = input.value.trim();
+  if (!msg || btn.disabled) return;
+
+  input.value = '';
+  btn.disabled = true;
+  addMsg('user', escHtml(msg));
+  const pending = addMsg('assistant', '<span class="thinking">Thinking…</span>', '');
+
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: msg }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Request failed');
+
+    pending.querySelector('div').innerHTML = escHtml(data.response).replace(/\\n/g, '<br>');
+    pending.querySelector('.meta').textContent =
+      `${data.model} · ${data.input_tokens} in / ${data.output_tokens} out · ${data.latency_ms}ms`;
+  } catch (err) {
+    pending.querySelector('div').innerHTML = `<span style="color:#f87171">Error: ${escHtml(err.message)}</span>`;
+    pending.querySelector('.meta').textContent = '';
+  }
+
+  btn.disabled = false;
+  input.focus();
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+</script>
+</body>
+</html>"""
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
