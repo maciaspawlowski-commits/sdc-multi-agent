@@ -30,13 +30,25 @@ _SYNTHETIC_PROMPTS = [
     "How does baggage propagation work in OpenTelemetry?",
 ]
 
-_SYNTHETIC_INTERVAL = int(os.getenv("SYNTHETIC_INTERVAL_SECONDS", "20"))
+_SYNTHETIC_INTERVAL = int(os.getenv("SYNTHETIC_INTERVAL_SECONDS", "5"))
+
+import json
+from asyncio import Queue
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from openai import OpenAI
 from opentelemetry import baggage, context, metrics, trace
 from pydantic import BaseModel
+
+# SSE subscribers — each connected browser tab gets its own queue
+_feed_subscribers: list[Queue] = []
+
+
+def _broadcast(event: dict) -> None:
+    payload = f"data: {json.dumps(event)}\n\n"
+    for q in _feed_subscribers:
+        q.put_nowait(payload)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -130,10 +142,20 @@ async def _synthetic_traffic_loop():
                     _token_counter.add(output_tokens, {**attrs, "gen_ai.token.type": "output"})
                     _duration_hist.record(latency_ms, attrs)
 
+                    content = response.choices[0].message.content or ""
                     logger.info(
                         "synthetic traffic ok in=%d out=%d latency_ms=%.0f",
                         input_tokens, output_tokens, latency_ms,
                     )
+
+                    _broadcast({
+                        "prompt": prompt,
+                        "response": content,
+                        "model": model,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "latency_ms": round(latency_ms, 1),
+                    })
             finally:
                 context.detach(tok)
 
@@ -174,6 +196,24 @@ def ui():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/api/feed")
+async def feed():
+    """SSE stream — pushes synthetic LLM events to connected browser tabs."""
+    q: Queue = Queue()
+    _feed_subscribers.append(q)
+
+    async def stream():
+        try:
+            while True:
+                payload = await q.get()
+                yield payload
+        finally:
+            _feed_subscribers.remove(q)
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -279,6 +319,8 @@ header h1 { font-size: 1.1rem; font-weight: 600; }
 .msg { max-width: 82%; padding: 12px 16px; border-radius: 14px; line-height: 1.55; word-break: break-word; }
 .user { align-self: flex-end; background: #0f62fe; color: white; border-bottom-right-radius: 4px; }
 .assistant { align-self: flex-start; background: #1a2232; border-bottom-left-radius: 4px; }
+.synthetic-q { align-self: flex-end; background: #1a2e1a; color: #86efac; border: 1px solid #166534; border-bottom-right-radius: 4px; font-style: italic; opacity: 0.75; }
+.synthetic-a { align-self: flex-start; background: #1a2e1a; color: #bbf7d0; border: 1px solid #166534; border-bottom-left-radius: 4px; opacity: 0.75; }
 .meta { font-size: 0.68rem; opacity: 0.45; margin-top: 7px; font-family: monospace; }
 footer { width: 100%; max-width: 800px; padding: 14px 20px; border-top: 1px solid #1e2a3a; display: flex; gap: 10px; }
 #input { flex: 1; background: #1a2232; border: 1px solid #2d3a4f; border-radius: 10px; padding: 11px 15px; color: #e2e8f0; font-size: 0.95rem; outline: none; transition: border-color .15s; }
@@ -325,6 +367,15 @@ if (!sessionId) {
 document.getElementById('session-badge').textContent = 'session: ' + sessionId.slice(0, 8) + '…';
 
 input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+
+// SSE — receive synthetic traffic events from the server
+const evtSource = new EventSource('/api/feed');
+evtSource.onmessage = (e) => {
+  const d = JSON.parse(e.data);
+  addMsg('synthetic-q', '🤖 <em>[synthetic]</em> ' + escHtml(d.prompt));
+  addMsg('synthetic-a', escHtml(d.response).replace(/\\n/g, '<br>'),
+    `${d.model} · ${d.input_tokens} in / ${d.output_tokens} out · ${d.latency_ms}ms · synthetic`);
+};
 
 function addMsg(role, html, meta) {
   const div = document.createElement('div');
