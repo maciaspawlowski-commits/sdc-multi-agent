@@ -67,8 +67,8 @@ def _broadcast(event: dict) -> None:
 _PROCESSOR_URL = os.getenv("PROCESSOR_URL", "http://localhost:8001")
 
 
-async def _processor(path: str, body: dict[str, Any]) -> dict[str, Any]:
-    """Call the processor service — fully async so it never blocks the event loop."""
+def _processor(path: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Call the processor service synchronously — clean, no async/thread conflicts."""
     with _tracer.start_as_current_span(
         f"processor{path}",
         kind=trace.SpanKind.CLIENT,
@@ -79,8 +79,7 @@ async def _processor(path: str, body: dict[str, Any]) -> dict[str, Any]:
         },
     ):
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(f"{_PROCESSOR_URL}{path}", json=body, timeout=5)
+            resp = httpx.post(f"{_PROCESSOR_URL}{path}", json=body, timeout=5)
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:
@@ -98,7 +97,7 @@ _token_counter: Optional[metrics.Counter] = None
 _duration_hist: Optional[metrics.Histogram] = None
 _request_counter: Optional[metrics.Counter] = None
 
-# Sync OpenAI client — LLMetry instruments this; calls run via asyncio.to_thread for concurrency
+# Sync OpenAI client — LLMetry instruments this; synthetic calls run via asyncio.to_thread
 _llm_client: Optional[OpenAI] = None
 
 
@@ -149,79 +148,85 @@ async def _synthetic_traffic_loop():
         try:
             prompt = random.choice(_SYNTHETIC_PROMPTS)
             model = os.getenv("LLM_MODEL", "llama3.2")
-            attrs = {"gen_ai.system": "ollama", "gen_ai.request.model": model}
-
-            ctx = baggage.set_baggage("session.id", "synthetic")
-            ctx = baggage.set_baggage("traffic.type", "synthetic", context=ctx)
-            tok = context.attach(ctx)
-
-            try:
-                with _tracer.start_as_current_span("llm.chat") as span:
-                    span.set_attribute("session.id", "synthetic")
-                    span.set_attribute("traffic.type", "synthetic")
-                    span.set_attribute("gen_ai.request.model", model)
-
-                    t0 = time.perf_counter()
-                    logger.info("synthetic traffic: prompt=%r", prompt[:60])
-
-                    # Simulate random errors (~20% of requests)
-                    if random.random() < _ERROR_RATE:
-                        err_type, err_msg = random.choice(_SYNTHETIC_ERRORS)
-                        latency_ms = (time.perf_counter() - t0) * 1000 + random.uniform(50, 800)
-                        span.set_attribute("error.type", err_type)
-                        span.record_exception(Exception(err_msg))
-                        _request_counter.add(1, {**attrs, "status": "error"})
-                        _duration_hist.record(latency_ms, {**attrs, "error": "true"})
-                        logger.error("synthetic error type=%s msg=%s", err_type, err_msg)
-                        _broadcast({"prompt": prompt, "error": err_msg, "error_type": err_type,
-                                    "latency_ms": round(latency_ms, 1)})
-                        continue
-
-                    pre = await _processor("/pre", {"prompt": prompt, "session_id": "synthetic"})
-                    clean_prompt = pre.get("prompt", prompt)
-
-                    response = await asyncio.to_thread(_llm_client.chat.completions.create,
-                        model=model,
-                        messages=[{"role": "user", "content": clean_prompt}],
-                    )
-                    latency_ms = (time.perf_counter() - t0) * 1000
-
-                    input_tokens = response.usage.prompt_tokens if response.usage else 0
-                    output_tokens = response.usage.completion_tokens if response.usage else 0
-                    raw_content = response.choices[0].message.content or ""
-
-                    post = await _processor("/post", {"response": raw_content, "session_id": "synthetic"})
-
-                    _request_counter.add(1, {**attrs, "status": "ok"})
-                    if input_tokens:
-                        _token_counter.add(input_tokens, {**attrs, "gen_ai.token.type": "input"})
-                    _token_counter.add(output_tokens, {**attrs, "gen_ai.token.type": "output"})
-                    _duration_hist.record(latency_ms, attrs)
-
-                    logger.info(
-                        "synthetic traffic ok in=%d out=%d latency_ms=%.0f sentiment=%s",
-                        input_tokens, output_tokens, latency_ms, post.get("sentiment", "?"),
-                    )
-
-                    _broadcast({
-                        "prompt": prompt,
-                        "response": raw_content,
-                        "model": model,
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "latency_ms": round(latency_ms, 1),
-                        "sentiment": post.get("sentiment", ""),
-                        "reading_time_s": post.get("reading_time_s", 0),
-                    })
-            finally:
-                context.detach(tok)
-
+            result = await asyncio.to_thread(_run_synthetic, prompt, model)
+            if result:
+                _broadcast(result)
         except asyncio.CancelledError:
             break
         except Exception as exc:
             logger.warning("synthetic traffic failed: %s", exc)
 
         await asyncio.sleep(_SYNTHETIC_INTERVAL)
+
+
+def _run_synthetic(prompt: str, model: str) -> Optional[dict]:
+    """Sync function: run one synthetic LLM request end-to-end (called via asyncio.to_thread)."""
+    session_id = f"synthetic-{uuid.uuid4().hex[:8]}"
+    t0 = time.perf_counter()
+    attrs = {"gen_ai.system": "ollama", "gen_ai.request.model": model}
+
+    # 20 % simulated errors — record a span + metric but return an error event
+    if random.random() < _ERROR_RATE:
+        err_type, err_msg = random.choice(_SYNTHETIC_ERRORS)
+        latency_ms = round(random.uniform(200, 2000), 1)
+        with _tracer.start_as_current_span("llm.chat.synthetic") as span:
+            span.set_attribute("session.id", session_id)
+            span.set_attribute("gen_ai.request.model", model)
+            span.set_attribute("error.type", err_type)
+            span.set_attribute("synthetic", True)
+            span.record_exception(Exception(err_msg))
+        _request_counter.add(1, {**attrs, "status": "error"})
+        _duration_hist.record(latency_ms, {**attrs, "error": "true"})
+        logger.warning("synthetic error session=%s type=%s msg=%s", session_id, err_type, err_msg)
+        return {"prompt": prompt, "error": err_msg, "error_type": err_type, "latency_ms": latency_ms}
+
+    with _tracer.start_as_current_span("llm.chat.synthetic") as span:
+        span.set_attribute("session.id", session_id)
+        span.set_attribute("gen_ai.request.model", model)
+        span.set_attribute("synthetic", True)
+        try:
+            pre = _processor("/pre", {"prompt": prompt, "session_id": session_id})
+            clean_prompt = pre.get("prompt", prompt)
+
+            response = _llm_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": clean_prompt}],
+            )
+            latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+            raw_content = response.choices[0].message.content or ""
+            input_tokens = response.usage.prompt_tokens if response.usage else 0
+            output_tokens = response.usage.completion_tokens if response.usage else 0
+
+            post = _processor("/post", {"response": raw_content, "session_id": session_id})
+            sentiment = post.get("sentiment", "neutral")
+            reading_time_s = post.get("reading_time_s", 0)
+
+            span.set_attribute("response.sentiment", sentiment)
+            span.set_attribute("response.reading_time_s", reading_time_s)
+
+            _request_counter.add(1, {**attrs, "status": "ok"})
+            if input_tokens:
+                _token_counter.add(input_tokens, {**attrs, "gen_ai.token.type": "input"})
+            _token_counter.add(output_tokens, {**attrs, "gen_ai.token.type": "output"})
+            _duration_hist.record(latency_ms, attrs)
+
+            logger.info(
+                "synthetic ok session=%s model=%s in=%d out=%d latency_ms=%.0f sentiment=%s",
+                session_id, model, input_tokens, output_tokens, latency_ms, sentiment,
+            )
+            return {
+                "prompt": prompt, "response": raw_content, "model": model,
+                "input_tokens": input_tokens, "output_tokens": output_tokens,
+                "latency_ms": latency_ms, "sentiment": sentiment, "reading_time_s": reading_time_s,
+            }
+        except Exception as exc:
+            latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+            span.record_exception(exc)
+            span.set_attribute("error.type", type(exc).__name__)
+            _request_counter.add(1, {**attrs, "status": "error"})
+            _duration_hist.record(latency_ms, {**attrs, "error": "true"})
+            logger.warning("synthetic failed session=%s error=%s", session_id, exc)
+            return {"prompt": prompt, "error": str(exc), "error_type": type(exc).__name__, "latency_ms": latency_ms}
 
 
 app = FastAPI(title="LLM Demo · Dash0", lifespan=lifespan)
@@ -274,7 +279,7 @@ async def feed():
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest, http_req: Request):
+def chat(req: ChatRequest, http_req: Request):
     model = os.getenv("LLM_MODEL", "llama3.2")
 
     # ── Baggage: carry session identity through the entire request context ──
@@ -303,7 +308,7 @@ async def chat(req: ChatRequest, http_req: Request):
 
             try:
                 # ── Pre-process: sanitise + enrich prompt ─────────────────
-                pre = await _processor("/pre", {"prompt": req.message, "session_id": session_id})
+                pre = _processor("/pre", {"prompt": req.message, "session_id": session_id})
                 clean_prompt = pre.get("prompt", req.message)
 
                 messages = [{"role": "user", "content": clean_prompt}]
@@ -311,8 +316,7 @@ async def chat(req: ChatRequest, http_req: Request):
                     messages.insert(0, {"role": "system", "content": req.system})
 
                 # LLMetry automatically creates a child span with GenAI attributes
-                response = await asyncio.to_thread(
-                    _llm_client.chat.completions.create,
+                response = _llm_client.chat.completions.create(
                     model=model,
                     messages=messages,
                 )
@@ -323,7 +327,7 @@ async def chat(req: ChatRequest, http_req: Request):
                 raw_content = response.choices[0].message.content or ""
 
                 # ── Post-process: enrich response with metadata ───────────
-                post = await _processor("/post", {"response": raw_content, "session_id": session_id})
+                post = _processor("/post", {"response": raw_content, "session_id": session_id})
                 content = post.get("response", raw_content)
                 span.set_attribute("response.sentiment", post.get("sentiment", "unknown"))
                 span.set_attribute("response.reading_time_s", post.get("reading_time_s", 0))
