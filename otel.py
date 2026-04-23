@@ -9,6 +9,7 @@ import os
 from opentelemetry import metrics, trace
 from opentelemetry._logs import set_logger_provider
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from opentelemetry.instrumentation.logging import LoggingInstrumentor
 from opentelemetry.instrumentation.openai import OpenAIInstrumentor
 from opentelemetry.sdk._logs import LoggerProvider
@@ -88,6 +89,9 @@ def setup_telemetry(app=None, service_name: str = None, service_version: str = N
 
     # ── LLMetry — auto-instrument OpenAI SDK calls ───────────────────────────
     OpenAIInstrumentor().instrument(capture_message_content=True)
+
+    # ── Auto-instrument outbound httpx calls (propagates W3C trace context) ──
+    HTTPXClientInstrumentor().instrument()
 
     # ── Auto-instrument FastAPI HTTP layer ───────────────────────────────────
     if app is not None:

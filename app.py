@@ -22,24 +22,14 @@ from typing import Any, Optional
 import httpx
 
 _SYNTHETIC_PROMPTS = [
-    "What are the trade-offs between head-based and tail-based trace sampling strategies in high-throughput distributed systems?",
-    "How does the OpenTelemetry Collector's processor pipeline differ from SDK-side processing, and when should you prefer each?",
-    "Explain how exemplars bridge the gap between metrics and traces in Prometheus and OpenTelemetry.",
-    "What are the cardinality pitfalls when designing metric label sets, and how do they affect TSDB performance?",
-    "How does W3C Trace Context propagation differ from B3 propagation, and what are the migration risks?",
-    "When should you use a histogram vs a summary metric, and what are the aggregation semantics differences in OpenTelemetry?",
-    "Describe the cold-start observability problem in serverless and how OTel instrumentation needs to adapt.",
-    "What is the difference between push-based and pull-based metrics collection, and how does the OTel Collector bridge both?",
-    "How do you design a meaningful SLO using error budget burn rate alerts without generating alert fatigue?",
-    "What are the observability implications of eventual consistency in distributed datastores, and how do you trace across async boundaries?",
-    "Compare RED, USE, and GOLDEN SIGNALS methodologies — when would you apply each in an LLM serving platform?",
-    "How does context propagation work across message queue boundaries in async architectures, and what OTel conventions apply?",
-    "What are the semantic conventions for GenAI observability in OpenTelemetry, and how mature is the spec today?",
-    "Explain the differences between span events, span links, and child spans — when is each the right modelling choice?",
-    "How do you instrument a streaming LLM response (server-sent events) with OpenTelemetry without losing token-level telemetry?",
-    "What is the role of the Resource in OTel, and how does it differ from span attributes for infrastructure correlation?",
-    "How do you detect and alert on LLM prompt injection attempts using observability data alone?",
-    "What are the observability challenges of multi-tenant LLM deployments, and how do you isolate per-tenant signals?",
+    "What is observability in software engineering?",
+    "Explain distributed tracing in one sentence.",
+    "What are the three pillars of observability?",
+    "How do metrics differ from logs?",
+    "What is OpenTelemetry and why does it matter?",
+    "Give me a one-line definition of a service mesh.",
+    "What is the purpose of a span in distributed tracing?",
+    "How does baggage propagation work in OpenTelemetry?",
 ]
 
 _SYNTHETIC_ERRORS = [
@@ -111,13 +101,10 @@ _request_counter: Optional[metrics.Counter] = None
 # Sync OpenAI client — LLMetry instruments this; calls run via asyncio.to_thread for concurrency
 _llm_client: Optional[OpenAI] = None
 
-# Semaphore created inside lifespan so it binds to uvicorn's event loop (Python 3.9 safe)
-_llm_semaphore: Optional[asyncio.Semaphore] = None
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _tracer, _token_counter, _duration_hist, _request_counter, _llm_client, _llm_semaphore
+    global _tracer, _token_counter, _duration_hist, _request_counter, _llm_client
 
     from otel import setup_telemetry
     setup_telemetry(app, service_version=APP_VERSION)
@@ -139,8 +126,6 @@ async def lifespan(app: FastAPI):
         unit="requests",
         description="Total LLM chat requests",
     )
-
-    _llm_semaphore = asyncio.Semaphore(1)  # Ollama is single-threaded on CPU
 
     ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
     _llm_client = OpenAI(
@@ -195,14 +180,10 @@ async def _synthetic_traffic_loop():
                     pre = await _processor("/pre", {"prompt": prompt, "session_id": "synthetic"})
                     clean_prompt = pre.get("prompt", prompt)
 
-                    if _llm_semaphore.locked():
-                        logger.info("synthetic: Ollama busy, skipping cycle")
-                        continue
-                    async with _llm_semaphore:
-                        response = await asyncio.to_thread(_llm_client.chat.completions.create,
-                            model=model,
-                            messages=[{"role": "user", "content": clean_prompt}],
-                        )
+                    response = await asyncio.to_thread(_llm_client.chat.completions.create,
+                        model=model,
+                        messages=[{"role": "user", "content": clean_prompt}],
+                    )
                     latency_ms = (time.perf_counter() - t0) * 1000
 
                     input_tokens = response.usage.prompt_tokens if response.usage else 0
@@ -330,12 +311,11 @@ async def chat(req: ChatRequest, http_req: Request):
                     messages.insert(0, {"role": "system", "content": req.system})
 
                 # LLMetry automatically creates a child span with GenAI attributes
-                async with _llm_semaphore:
-                    response = await asyncio.to_thread(
-                        _llm_client.chat.completions.create,
-                        model=model,
-                        messages=messages,
-                    )
+                response = await asyncio.to_thread(
+                    _llm_client.chat.completions.create,
+                    model=model,
+                    messages=messages,
+                )
                 latency_ms = (time.perf_counter() - t0) * 1000
 
                 input_tokens = response.usage.prompt_tokens if response.usage else 0
