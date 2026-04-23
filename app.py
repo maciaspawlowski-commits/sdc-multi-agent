@@ -111,6 +111,9 @@ _request_counter: Optional[metrics.Counter] = None
 # Sync OpenAI client — LLMetry instruments this; calls run via asyncio.to_thread for concurrency
 _llm_client: Optional[OpenAI] = None
 
+# Semaphore: Ollama runs on CPU and handles one request at a time — queue rather than crash
+_llm_semaphore = asyncio.Semaphore(1)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -190,10 +193,11 @@ async def _synthetic_traffic_loop():
                     pre = await _processor("/pre", {"prompt": prompt, "session_id": "synthetic"})
                     clean_prompt = pre.get("prompt", prompt)
 
-                    response = await asyncio.to_thread(_llm_client.chat.completions.create,
-                        model=model,
-                        messages=[{"role": "user", "content": clean_prompt}],
-                    )
+                    async with _llm_semaphore:
+                        response = await asyncio.to_thread(_llm_client.chat.completions.create,
+                            model=model,
+                            messages=[{"role": "user", "content": clean_prompt}],
+                        )
                     latency_ms = (time.perf_counter() - t0) * 1000
 
                     input_tokens = response.usage.prompt_tokens if response.usage else 0
@@ -321,11 +325,12 @@ async def chat(req: ChatRequest, http_req: Request):
                     messages.insert(0, {"role": "system", "content": req.system})
 
                 # LLMetry automatically creates a child span with GenAI attributes
-                response = await asyncio.to_thread(
-                    _llm_client.chat.completions.create,
-                    model=model,
-                    messages=messages,
-                )
+                async with _llm_semaphore:
+                    response = await asyncio.to_thread(
+                        _llm_client.chat.completions.create,
+                        model=model,
+                        messages=messages,
+                    )
                 latency_ms = (time.perf_counter() - t0) * 1000
 
                 input_tokens = response.usage.prompt_tokens if response.usage else 0
