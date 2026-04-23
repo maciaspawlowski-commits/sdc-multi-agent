@@ -111,13 +111,13 @@ _request_counter: Optional[metrics.Counter] = None
 # Sync OpenAI client — LLMetry instruments this; calls run via asyncio.to_thread for concurrency
 _llm_client: Optional[OpenAI] = None
 
-# Semaphore: Ollama runs on CPU and handles one request at a time — queue rather than crash
-_llm_semaphore = asyncio.Semaphore(1)
+# Semaphore created inside lifespan so it binds to uvicorn's event loop (Python 3.9 safe)
+_llm_semaphore: Optional[asyncio.Semaphore] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _tracer, _token_counter, _duration_hist, _request_counter, _llm_client
+    global _tracer, _token_counter, _duration_hist, _request_counter, _llm_client, _llm_semaphore
 
     from otel import setup_telemetry
     setup_telemetry(app, service_version=APP_VERSION)
@@ -139,6 +139,8 @@ async def lifespan(app: FastAPI):
         unit="requests",
         description="Total LLM chat requests",
     )
+
+    _llm_semaphore = asyncio.Semaphore(1)  # Ollama is single-threaded on CPU
 
     ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
     _llm_client = OpenAI(
@@ -193,6 +195,9 @@ async def _synthetic_traffic_loop():
                     pre = await _processor("/pre", {"prompt": prompt, "session_id": "synthetic"})
                     clean_prompt = pre.get("prompt", prompt)
 
+                    if _llm_semaphore.locked():
+                        logger.info("synthetic: Ollama busy, skipping cycle")
+                        continue
                     async with _llm_semaphore:
                         response = await asyncio.to_thread(_llm_client.chat.completions.create,
                             model=model,
