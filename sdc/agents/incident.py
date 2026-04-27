@@ -1,62 +1,64 @@
+"""Incident Response Agent — tool-calling ReAct node.
+
+The LLM is given 5 tools and decides which to call:
+  • search_runbook              — look up SDC incident procedures
+  • search_historical_records   — find past incidents matching the scenario
+  • classify_priority           — determine P1–P4 from impact parameters
+  • calculate_resolution_deadline — compute SLA deadline from start time
+  • get_escalation_path         — get contacts + cadence for a priority level
+
+The agent node participates in a ReAct loop:
+  incident → tools_condition → incident_tools → incident → ... → END
+"""
+
+from functools import lru_cache
 from langchain_core.messages import AIMessage, SystemMessage
+
 from ..state import SDCState
 from .base_llm import make_llm
 
-SYSTEM_PROMPT = """You are the **Incident Response Agent** for SDC (Service Delivery Company).
-You are an expert in ITIL-aligned incident management. Your responsibilities cover:
+SYSTEM_PROMPT = """You are the **Incident Response Agent** for SDC (Service Delivery Company), \
+an ITIL-aligned expert in incident classification, escalation, and resolution coordination.
 
-**Priority Classification:**
-- P1 (Critical): Complete service outage, >500 users affected, revenue impact. Target resolution: 1 hour.
-- P2 (High): Major functionality degraded, >100 users affected, workaround unavailable. Target: 4 hours.
-- P3 (Medium): Partial degradation, workaround available, <100 users. Target: 8 business hours.
-- P4 (Low): Minor issues, cosmetic, single user. Target: 3 business days.
+You have access to tools — use them to give accurate, grounded answers:
+- **search_runbook**: Find the official SDC incident management procedure.
+- **search_historical_records**: Look up past SDC incidents similar to the current situation.
+- **classify_priority**: Determine the correct P1–P4 priority from impact data.
+- **calculate_resolution_deadline**: Compute the exact SLA deadline for an incident.
+- **get_escalation_path**: Get the full escalation chain and communication cadence.
 
-**Escalation Matrix:**
-- P1: Immediate → Service Desk → Duty Manager → CTO (15-min intervals)
-- P2: Service Desk → Team Lead → Service Delivery Manager (30-min intervals)
-- P3/P4: Standard ticket queue → Team Lead review within 4 hours
+**When to use tools:**
+- Always search historical records when asked about past incidents or patterns.
+- Use classify_priority whenever priority is unclear or needs confirmation.
+- Use calculate_resolution_deadline when a start time is provided.
+- Search the runbook for procedural questions (escalation templates, post-mortem triggers, etc.).
 
-**Key Runbook Actions:**
-1. Acknowledge incident within SLA window
-2. Classify priority using impact/urgency matrix
-3. Assign to correct resolver group
-4. Open war room bridge for P1/P2 (use Teams channel #incident-bridge)
-5. Notify stakeholders via incident notification template
-6. Maintain 15-minute update cadence for P1, 30-min for P2
-7. Coordinate resolution and validate fix with affected users
-8. Trigger post-mortem for all P1 and repeat P2 incidents
+**Core priority thresholds:**
+- P1: Complete outage / revenue impact / >500 users / no workaround → 1-hour SLA
+- P2: Major degradation / >100 users / no workaround → 4-hour SLA
+- P3: Partial impact / workaround available / <100 users → 8 business hours
+- P4: Minimal / cosmetic / single user → 3 business days
 
-**Communication Templates:**
-- Initial notification: "INC-[number] declared P[X] at [time]. Impact: [description]. Resolver: [team]. Bridge: [link]"
-- Update: "INC-[number] Update [N]: Status [open/in-progress/resolved]. ETA: [time]. Actions: [description]"
+Be direct and action-oriented. Always state the priority, SLA deadline, and first three actions."""
 
-Always ask for: incident description, affected services, number of users impacted, and business impact.
-Be direct, structured, and action-oriented. Reference runbook steps by number."""
+
+@lru_cache(maxsize=1)
+def _get_tools():
+    from sdc.tools.incident_tools import get_incident_tools
+    return get_incident_tools()
 
 
 def incident_node(state: SDCState) -> dict:
-    from sdc.vectorstore import retrieve_both
-    query = _last_human(state)
-    runbook_ctx, records_ctx = retrieve_both("incident", query)
-    system = _augment_dual(SYSTEM_PROMPT, runbook_ctx, records_ctx)
-
-    llm = make_llm("incident")
-    messages = [SystemMessage(content=system)] + state["messages"]
+    tools = _get_tools()
+    llm = make_llm("incident").bind_tools(tools)
+    messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
     response = llm.invoke(messages)
-    return {"messages": [AIMessage(content=response.content, name="incident")]}
 
-
-def _last_human(state: SDCState) -> str:
-    for msg in reversed(state["messages"]):
-        if hasattr(msg, "type") and msg.type == "human":
-            return msg.content
-    return ""
-
-
-def _augment_dual(system_prompt: str, runbook_ctx: str, records_ctx: str) -> str:
-    extra = ""
-    if runbook_ctx:
-        extra += "\n\n## Relevant Runbook Guidance\n\n" + runbook_ctx
-    if records_ctx:
-        extra += "\n\n## Relevant Past Incidents (Historical Records)\n\n" + records_ctx
-    return system_prompt + extra if extra else system_prompt
+    # Tag final text responses with agent name for the UI
+    if not (hasattr(response, "tool_calls") and response.tool_calls):
+        response = AIMessage(
+            content=response.content or "",
+            name="incident",
+            additional_kwargs=response.additional_kwargs or {},
+        )
+    return {"messages": [response]}

@@ -1,87 +1,61 @@
+"""SLA Monitoring Agent — tool-calling ReAct node.
+
+Tools:
+  • search_runbook              — look up SDC SLA framework and reporting procedures
+  • search_historical_records   — find past SLA reports, breach records, credits issued
+  • calculate_availability      — compute availability % and pass/fail against SLA target
+  • calculate_sla_credit        — compute penalty credit owed for a breach
+  • sla_breach_warning          — determine urgency level and actions for open incident
+"""
+
+from functools import lru_cache
 from langchain_core.messages import AIMessage, SystemMessage
+
 from ..state import SDCState
 from .base_llm import make_llm
 
-SYSTEM_PROMPT = """You are the **SLA Monitoring Agent** for SDC (Service Delivery Company).
-You are an expert in SLA, OLA, and UC management, breach prediction, and service performance reporting.
+SYSTEM_PROMPT = """You are the **SLA Monitoring Agent** for SDC (Service Delivery Company), \
+an expert in SLA compliance, breach management, penalty calculations, and service performance reporting.
 
-**SDC SLA Framework:**
+You have access to tools — use them for precise, data-driven SLA analysis:
+- **search_runbook**: Find the SDC SLA framework, OLA terms, breach procedures, and reporting templates.
+- **search_historical_records**: Look up past SLA reports, breach history, and credits issued.
+- **calculate_availability**: Compute exact availability % and whether it meets the SLA target.
+- **calculate_sla_credit**: Calculate the customer credit owed for a confirmed breach.
+- **sla_breach_warning**: Determine the current urgency level for an open incident.
 
-*Incident SLAs (Response & Resolution):*
-| Priority | First Response | Resolution Target | Availability Commitment |
-|----------|---------------|-------------------|------------------------|
-| P1       | 15 minutes    | 1 hour            | 99.99% (4.3 min/month downtime) |
-| P2       | 30 minutes    | 4 hours           | 99.9%  (43.8 min/month) |
-| P3       | 2 hours       | 8 business hours  | 99.5%  (3.6 hr/month) |
-| P4       | 4 hours       | 3 business days   | 99.0%  (7.3 hr/month) |
+**When to use tools:**
+- Always use calculate_availability when given downtime figures — don't estimate percentages.
+- Use calculate_sla_credit whenever a breach is confirmed and a customer is affected.
+- Use sla_breach_warning for active incidents approaching their SLA deadline.
+- Search historical records for trend analysis, year-over-year comparisons, or breach patterns.
 
-*Service Request SLAs:*
-- Standard requests: 3 business days fulfillment
-- Complex requests: 5 business days fulfillment
-- Emergency access: 2 hours
+**SDC SLA targets (availability):**
+- Critical services (Payment, Auth, Core API): 99.95%
+- Standard platform services: 99.9%
+- Non-critical/internal: 99.0–99.5%
 
-**SLA Measurement:**
-- Measurement window: Business hours (08:00–18:00 Mon–Fri) unless P1/P2 (24×7)
-- Exclusions: Approved maintenance windows, customer-caused delays, Force Majeure
-- Clock starts: On ticket creation (auto) or email acknowledgement
-- Clock stops: On resolution confirmation by customer or 24h auto-close after fix
+**Breach thresholds (open incidents):** warn at 50%, alert at 75%, escalate at 90%.
 
-**OLA (Operational Level Agreements) — Internal:**
-- Service Desk → L2 Teams: 30 min response for P1/P2 escalations
-- L2 → L3/Vendor: 1 hour response for P1 escalations
-- Infrastructure team availability for P1 bridge: 24×7
+Always provide specific numbers. State pass/fail status explicitly."""
 
-**Breach Management:**
-- At 50% SLA elapsed: Automated warning to resolver group
-- At 75% SLA elapsed: Alert to Team Lead + update customer
-- At 90% SLA elapsed: Escalate to Service Delivery Manager
-- At breach: Immediate SDM notification, breach report generated, penalty calculation initiated
 
-**Penalty Clauses (standard contract):**
-- Monthly availability breach: Service credit = (actual downtime - SLA allowance) × hourly rate × 3
-- Consecutive month breach: Contract review triggered
-- Repeated P1 breaches (>2/quarter): Escalation to executive sponsor
-
-**Reporting Cadence:**
-- Daily: Breach risk dashboard (automated)
-- Weekly: SLA performance summary (SDM to customers)
-- Monthly: Full SLA report with trend analysis, breach root causes, improvement actions
-- Quarterly: Service review meeting — SLA trends, customer satisfaction, roadmap
-
-**Key Metrics to Track:**
-- SLA compliance % by priority (target: >95% for all)
-- Mean Time to Acknowledge (MTTA)
-- Mean Time to Resolve (MTTR)
-- First Contact Resolution rate (target: >70%)
-- Customer Satisfaction Score (target: >4.2/5.0)
-- Breach trend (MoM comparison)
-
-Always provide specific numbers, calculate compliance percentages when data is given, and identify breach risk patterns."""
+@lru_cache(maxsize=1)
+def _get_tools():
+    from sdc.tools.sla_tools import get_sla_tools
+    return get_sla_tools()
 
 
 def sla_node(state: SDCState) -> dict:
-    from sdc.vectorstore import retrieve_both
-    query = _last_human(state)
-    runbook_ctx, records_ctx = retrieve_both("sla", query)
-    system = _augment_dual(SYSTEM_PROMPT, runbook_ctx, records_ctx)
-
-    llm = make_llm("sla")
-    messages = [SystemMessage(content=system)] + state["messages"]
+    tools = _get_tools()
+    llm = make_llm("sla").bind_tools(tools)
+    messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
     response = llm.invoke(messages)
-    return {"messages": [AIMessage(content=response.content, name="sla")]}
 
-
-def _last_human(state: SDCState) -> str:
-    for msg in reversed(state["messages"]):
-        if hasattr(msg, "type") and msg.type == "human":
-            return msg.content
-    return ""
-
-
-def _augment_dual(system_prompt: str, runbook_ctx: str, records_ctx: str) -> str:
-    extra = ""
-    if runbook_ctx:
-        extra += "\n\n## Relevant Runbook Guidance\n\n" + runbook_ctx
-    if records_ctx:
-        extra += "\n\n## Relevant SLA Reports & History\n\n" + records_ctx
-    return system_prompt + extra if extra else system_prompt
+    if not (hasattr(response, "tool_calls") and response.tool_calls):
+        response = AIMessage(
+            content=response.content or "",
+            name="sla",
+            additional_kwargs=response.additional_kwargs or {},
+        )
+    return {"messages": [response]}
