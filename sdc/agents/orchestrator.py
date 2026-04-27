@@ -6,6 +6,7 @@ from langchain_core.messages import SystemMessage
 from langchain_ollama import ChatOllama
 from ..state import SDCState
 from .base_llm import make_llm
+from .tracing import graph_node_span
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ Respond with ONLY valid JSON in this exact format, nothing else:
 {"agent": "<category>", "reason": "<one sentence explaining why>"}"""
 
 
+@graph_node_span("orchestrator", node_type="orchestrator")
 def orchestrate_node(state: SDCState) -> dict:
     """Classify the latest user message and set current_agent in state."""
     try:

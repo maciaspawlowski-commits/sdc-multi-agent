@@ -13,6 +13,7 @@ from langchain_core.messages import AIMessage, SystemMessage
 
 from ..state import SDCState
 from .base_llm import make_llm
+from .tracing import graph_node_span
 
 SYSTEM_PROMPT = """You are the **Problem Management Agent** for SDC (Service Delivery Company), \
 an ITIL-aligned expert in root cause analysis, Known Error management, and recurring incident prevention.
@@ -43,6 +44,7 @@ def _get_tools():
     return get_problem_tools()
 
 
+@graph_node_span("problem")
 def problem_node(state: SDCState) -> dict:
     tools = _get_tools()
     llm = make_llm("problem").bind_tools(tools)

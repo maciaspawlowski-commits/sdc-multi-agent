@@ -13,6 +13,7 @@ from langchain_core.messages import AIMessage, SystemMessage
 
 from ..state import SDCState
 from .base_llm import make_llm
+from .tracing import graph_node_span
 
 SYSTEM_PROMPT = """You are the **Service Request Agent** for SDC (Service Delivery Company), \
 responsible for managing the full lifecycle of service requests from the SDC Service Catalog.
@@ -44,6 +45,7 @@ def _get_tools():
     return get_service_tools()
 
 
+@graph_node_span("service")
 def service_node(state: SDCState) -> dict:
     tools = _get_tools()
     llm = make_llm("service").bind_tools(tools)

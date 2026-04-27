@@ -13,6 +13,7 @@ from langchain_core.messages import AIMessage, SystemMessage
 
 from ..state import SDCState
 from .base_llm import make_llm
+from .tracing import graph_node_span
 
 SYSTEM_PROMPT = """You are the **SLA Monitoring Agent** for SDC (Service Delivery Company), \
 an expert in SLA compliance, breach management, penalty calculations, and service performance reporting.
@@ -46,6 +47,7 @@ def _get_tools():
     return get_sla_tools()
 
 
+@graph_node_span("sla")
 def sla_node(state: SDCState) -> dict:
     tools = _get_tools()
     llm = make_llm("sla").bind_tools(tools)

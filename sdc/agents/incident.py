@@ -16,6 +16,7 @@ from langchain_core.messages import AIMessage, SystemMessage
 
 from ..state import SDCState
 from .base_llm import make_llm
+from .tracing import graph_node_span
 
 SYSTEM_PROMPT = """You are the **Incident Response Agent** for SDC (Service Delivery Company), \
 an ITIL-aligned expert in incident classification, escalation, and resolution coordination.
@@ -48,6 +49,7 @@ def _get_tools():
     return get_incident_tools()
 
 
+@graph_node_span("incident")
 def incident_node(state: SDCState) -> dict:
     tools = _get_tools()
     llm = make_llm("incident").bind_tools(tools)

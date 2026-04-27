@@ -13,6 +13,7 @@ from langchain_core.messages import AIMessage, SystemMessage
 
 from ..state import SDCState
 from .base_llm import make_llm
+from .tracing import graph_node_span
 
 SYSTEM_PROMPT = """You are the **Change Management Agent** for SDC (Service Delivery Company), \
 an ITIL-aligned expert in RFC management, CAB governance, and safe change delivery.
@@ -45,6 +46,7 @@ def _get_tools():
     return get_change_tools()
 
 
+@graph_node_span("change")
 def change_node(state: SDCState) -> dict:
     tools = _get_tools()
     llm = make_llm("change").bind_tools(tools)

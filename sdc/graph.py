@@ -27,7 +27,7 @@ a final answer before exiting to END.
 """
 
 from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import tools_condition
 
 from .state import SDCState
 from .agents.orchestrator import orchestrate_node
@@ -36,6 +36,7 @@ from .agents.change import change_node
 from .agents.problem import problem_node
 from .agents.service import service_node
 from .agents.sla import sla_node
+from .agents.tracing import make_instrumented_tool_node
 
 
 def _route(state: SDCState) -> str:
@@ -65,15 +66,17 @@ def build_graph() -> object:
     g.add_node("sla",      sla_node)
 
     # ── Tool executor nodes (one per agent) ──────────────────────────────────
+    # make_instrumented_tool_node wraps ToolNode in an sdc.graph.node OTel span
+    # so that tool.invoke child spans nest under it in the Dash0 trace tree.
     # ToolNode automatically:
     #   • reads tool_calls from the last AIMessage
     #   • executes each tool
     #   • appends ToolMessage results back into state["messages"]
-    g.add_node("incident_tools", ToolNode(get_incident_tools()))
-    g.add_node("change_tools",   ToolNode(get_change_tools()))
-    g.add_node("problem_tools",  ToolNode(get_problem_tools()))
-    g.add_node("service_tools",  ToolNode(get_service_tools()))
-    g.add_node("sla_tools",      ToolNode(get_sla_tools()))
+    g.add_node("incident_tools", make_instrumented_tool_node(get_incident_tools(), "incident_tools"))
+    g.add_node("change_tools",   make_instrumented_tool_node(get_change_tools(),   "change_tools"))
+    g.add_node("problem_tools",  make_instrumented_tool_node(get_problem_tools(),  "problem_tools"))
+    g.add_node("service_tools",  make_instrumented_tool_node(get_service_tools(),  "service_tools"))
+    g.add_node("sla_tools",      make_instrumented_tool_node(get_sla_tools(),      "sla_tools"))
 
     # ── Entry point ──────────────────────────────────────────────────────────
     g.set_entry_point("orchestrator")

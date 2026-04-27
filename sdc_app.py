@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -27,13 +28,19 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from langchain_core.messages import HumanMessage
 from opentelemetry import metrics, trace
 from pydantic import BaseModel
 
 from sdc.graph import sdc_graph
+from sdc.simulation.black_friday import get_black_friday_steps
 from sdc.state import AGENT_ICONS, AGENT_NAMES
+from sdc_otel import SDCToolsCallback
+
+# Singleton callback — created once, reused across all requests so metric
+# instruments are only registered once (lazy inside SDCToolsCallback).
+_tools_callback = SDCToolsCallback()
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -151,7 +158,10 @@ async def chat(req: ChatRequest):
         }
 
         try:
-            result = await sdc_graph.ainvoke(initial_state)
+            result = await sdc_graph.ainvoke(
+                initial_state,
+                config={"callbacks": [_tools_callback]},
+            )
         except Exception as exc:
             latency_ms = (time.perf_counter() - t0) * 1000
             span.record_exception(exc)
@@ -204,6 +214,127 @@ async def chat(req: ChatRequest):
 def clear_session(session_id: str):
     _sessions.pop(session_id, None)
     return {"cleared": session_id}
+
+
+@app.post("/api/simulate/black-friday")
+async def simulate_black_friday():
+    """Stream a Black Friday scenario as server-sent events.
+
+    Each event is a JSON object on a ``data:`` line.  Event types:
+      • ``step_start``   — step is about to run (description + query)
+      • ``step_end``     — step completed (agent, response, latency_ms)
+      • ``error``        — step failed (error message)
+      • ``sim_complete`` — all steps finished
+    """
+    sim_session_id = str(uuid.uuid4())
+    steps = get_black_friday_steps()
+
+    async def event_stream():
+        for i, step in enumerate(steps, 1):
+            # ── announce step ────────────────────────────────────────────────
+            yield (
+                "data: "
+                + json.dumps({
+                    "type":        "step_start",
+                    "step":        i,
+                    "total":       len(steps),
+                    "description": step["description"],
+                    "query":       step["query"],
+                })
+                + "\n\n"
+            )
+
+            # ── run the agent graph ─────────────────────────────────────────
+            try:
+                history = _sessions.get(sim_session_id, [])
+                history.append(HumanMessage(content=step["query"]))
+
+                t0 = time.perf_counter()
+                result = await sdc_graph.ainvoke(
+                    {
+                        "messages":      history,
+                        "current_agent": None,
+                        "routing_reason": None,
+                    },
+                    config={"callbacks": [_tools_callback]},
+                )
+                latency_ms = round((time.perf_counter() - t0) * 1000)
+
+                # Persist growing conversation history
+                _sessions[sim_session_id] = list(result["messages"])
+
+                ai_msgs = [
+                    m for m in result["messages"]
+                    if hasattr(m, "type") and m.type == "ai"
+                ]
+                last_ai   = ai_msgs[-1] if ai_msgs else None
+                agent     = result.get("current_agent", "incident")
+                reason    = result.get("routing_reason", "")
+
+                # Emit OTel metric for the simulation request
+                if _agent_counter:
+                    _agent_counter.add(1, {"sdc.agent": agent, "llm.model": LLM_MODEL, "sdc.sim": "black_friday"})
+                if _latency_hist:
+                    _latency_hist.record(latency_ms, {"sdc.agent": agent, "status": "ok", "sdc.sim": "black_friday"})
+
+                logger.info(
+                    "sim step=%d/%d agent=%s latency_ms=%d session=%s",
+                    i, len(steps), agent, latency_ms, sim_session_id,
+                )
+
+                yield (
+                    "data: "
+                    + json.dumps({
+                        "type":        "step_end",
+                        "step":        i,
+                        "total":       len(steps),
+                        "agent":       agent,
+                        "agent_name":  AGENT_NAMES.get(agent, agent),
+                        "agent_icon":  AGENT_ICONS.get(agent, "🤖"),
+                        "routing_reason": reason,
+                        "response":    last_ai.content if last_ai else "",
+                        "latency_ms":  latency_ms,
+                    })
+                    + "\n\n"
+                )
+
+            except Exception as exc:
+                logger.error(
+                    "sim error step=%d session=%s error=%s", i, sim_session_id, exc
+                )
+                yield (
+                    "data: "
+                    + json.dumps({
+                        "type":  "error",
+                        "step":  i,
+                        "error": str(exc),
+                    })
+                    + "\n\n"
+                )
+
+            # Small pause so the client can render before the next heavy LLM call
+            await asyncio.sleep(0.3)
+
+        # ── all done ─────────────────────────────────────────────────────────
+        _sessions.pop(sim_session_id, None)   # clean up sim session
+        yield (
+            "data: "
+            + json.dumps({
+                "type":        "sim_complete",
+                "total_steps": len(steps),
+                "session_id":  sim_session_id,
+            })
+            + "\n\n"
+        )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",   # disable nginx buffering
+        },
+    )
 
 
 # ── Embedded HTML/JS frontend ────────────────────────────────────────────────
@@ -297,6 +428,111 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; 
 .prompt-chip {{ background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px; font-size: 0.82rem; cursor: pointer; transition: border-color .15s; line-height: 1.4; }}
 .prompt-chip:hover {{ border-color: var(--blue); color: var(--text); }}
 .prompt-chip .chip-label {{ color: var(--muted); font-size: 0.7rem; margin-bottom: 2px; }}
+
+/* ── Black Friday simulation button ── */
+.sim-btn {{
+  margin-left: auto; background: rgba(248,81,73,.12); color: #f85149;
+  border: 1px solid rgba(248,81,73,.35); border-radius: 8px; padding: 5px 13px;
+  cursor: pointer; font-size: 0.78rem; font-weight: 600; letter-spacing: .01em;
+  transition: all .15s; white-space: nowrap;
+}}
+.sim-btn:hover {{ background: rgba(248,81,73,.22); border-color: rgba(248,81,73,.6); }}
+.sim-btn:disabled {{ opacity: .4; cursor: default; }}
+
+/* ── Simulation overlay (full-screen backdrop) ── */
+.sim-overlay {{
+  position: fixed; inset: 0; background: rgba(0,0,0,.82); backdrop-filter: blur(5px);
+  z-index: 200; display: flex; flex-direction: column; align-items: center;
+  justify-content: flex-end;
+}}
+.sim-overlay.hidden {{ display: none; }}
+
+/* ── Simulation panel (bottom sheet) ── */
+.sim-panel {{
+  background: var(--bg); border: 1px solid var(--border); border-bottom: none;
+  border-radius: 16px 16px 0 0; width: 100%; max-width: 980px; height: 88vh;
+  display: flex; flex-direction: column; overflow: hidden;
+  animation: sim-slide-up .28s cubic-bezier(.22,.68,0,1.2);
+}}
+@keyframes sim-slide-up {{
+  from {{ transform: translateY(60px); opacity: 0; }}
+  to   {{ transform: translateY(0);    opacity: 1; }}
+}}
+
+/* ── Panel header ── */
+.sim-header {{
+  background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0;
+  padding: 14px 18px; display: flex; align-items: center; gap: 12px;
+}}
+.sim-header-title {{ font-size: 0.92rem; font-weight: 600; }}
+.sim-header-sub {{ font-size: 0.72rem; color: var(--muted); }}
+.sim-progress-wrap {{ flex: 1; }}
+.sim-progress-track {{
+  height: 5px; background: var(--border); border-radius: 3px; overflow: hidden;
+}}
+.sim-progress-bar {{
+  height: 100%; background: #f85149; border-radius: 3px;
+  transition: width .45s ease; width: 0%;
+}}
+.sim-step-counter {{ font-size: 0.72rem; color: var(--muted); margin-top: 4px; text-align: right; }}
+.sim-close-btn {{
+  background: transparent; border: 1px solid var(--border); color: var(--muted);
+  border-radius: 6px; padding: 5px 11px; cursor: pointer; font-size: 0.78rem;
+  transition: all .15s;
+}}
+.sim-close-btn:hover {{ border-color: var(--text); color: var(--text); }}
+
+/* ── Panel body — step timeline ── */
+.sim-body {{ flex: 1; overflow-y: auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 28px; }}
+
+.sim-step {{ display: flex; flex-direction: column; gap: 6px; }}
+
+.sim-step-header {{
+  display: flex; align-items: center; gap: 8px; margin-bottom: 4px;
+}}
+.sim-step-num {{
+  width: 22px; height: 22px; border-radius: 50%; display: inline-flex;
+  align-items: center; justify-content: center; font-size: 0.65rem; font-weight: 700;
+  flex-shrink: 0;
+  background: var(--border); color: var(--muted); border: 1px solid transparent;
+}}
+.sim-step-num.running {{
+  background: rgba(248,81,73,.18); color: #f85149;
+  border-color: rgba(248,81,73,.45); animation: pulse 1.1s ease-in-out infinite;
+}}
+.sim-step-num.done {{
+  background: rgba(56,139,53,.18); color: #3fb950; border-color: rgba(56,139,53,.45);
+}}
+.sim-step-num.errored {{
+  background: rgba(248,81,73,.18); color: #f85149; border-color: rgba(248,81,73,.45);
+}}
+.sim-step-desc {{ font-size: 0.72rem; color: var(--muted); font-style: italic; }}
+
+.sim-query-bubble {{
+  align-self: flex-end; max-width: 78%;
+  background: var(--blue); color: #fff; padding: 10px 15px;
+  border-radius: 12px 12px 3px 12px; font-size: 0.85rem; line-height: 1.55;
+}}
+.sim-response-bubble {{
+  align-self: flex-start; max-width: 88%;
+  background: var(--surface); border: 1px solid var(--border);
+  padding: 11px 15px; border-radius: 12px 12px 12px 3px;
+  font-size: 0.85rem; line-height: 1.6; white-space: pre-wrap;
+}}
+.sim-response-bubble.thinking {{
+  opacity: .5; font-style: italic; animation: pulse 1.2s ease-in-out infinite;
+}}
+.sim-response-meta {{
+  display: flex; align-items: center; gap: 7px;
+  font-size: 0.65rem; color: var(--muted); margin-top: 4px;
+}}
+
+.sim-done-banner {{
+  text-align: center; padding: 22px; margin-top: 8px;
+  background: rgba(56,139,53,.08); border: 1px solid rgba(56,139,53,.28);
+  border-radius: 10px; color: #3fb950; font-size: 0.9rem; line-height: 1.7;
+}}
+.sim-done-banner small {{ display: block; color: var(--muted); font-size: 0.75rem; margin-top: 4px; }}
 </style>
 </head>
 <body>
@@ -308,6 +544,9 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; 
   <span class="badge badge-blue">LangGraph</span>
   <span class="badge badge-orange">6 Agents</span>
   <span class="badge badge-purple" id="session-badge">session: …</span>
+  <button class="sim-btn" id="sim-btn" onclick="openSimulation()" title="Run a scripted Black Friday incident scenario through all five agents">
+    🛒 Black Friday Sim
+  </button>
 </div>
 
 <div class="layout">
@@ -362,6 +601,31 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; 
     </div>
   </main>
 
+</div>
+
+<!-- Black Friday simulation overlay -->
+<div class="sim-overlay hidden" id="sim-overlay" onclick="overlayClick(event)">
+  <div class="sim-panel" id="sim-panel">
+
+    <!-- Header -->
+    <div class="sim-header">
+      <div>
+        <div class="sim-header-title">🛒 Black Friday Simulation</div>
+        <div class="sim-header-sub" id="sim-header-sub">Preparing scenario…</div>
+      </div>
+      <div class="sim-progress-wrap">
+        <div class="sim-progress-track">
+          <div class="sim-progress-bar" id="sim-progress-bar"></div>
+        </div>
+        <div class="sim-step-counter" id="sim-step-counter"></div>
+      </div>
+      <button class="sim-close-btn" onclick="closeSimulation()">✕ Close</button>
+    </div>
+
+    <!-- Step timeline -->
+    <div class="sim-body" id="sim-body"></div>
+
+  </div>
 </div>
 
 <script>
@@ -500,6 +764,162 @@ async function send() {{
   }} finally {{
     sendBtn.disabled = false;
     input.focus();
+  }}
+}}
+
+// ── Black Friday Simulation ──────────────────────────────────────────────────
+
+let simAbort = null;
+
+function openSimulation() {{
+  document.getElementById('sim-overlay').classList.remove('hidden');
+  document.getElementById('sim-btn').disabled = true;
+  document.getElementById('sim-body').innerHTML = '';
+  document.getElementById('sim-progress-bar').style.width = '0%';
+  document.getElementById('sim-step-counter').textContent = '';
+  document.getElementById('sim-header-sub').textContent = 'Connecting to agent system…';
+  simAbort = new AbortController();
+  runSimulation(simAbort.signal);
+}}
+
+function closeSimulation() {{
+  if (simAbort) {{ simAbort.abort(); simAbort = null; }}
+  document.getElementById('sim-overlay').classList.add('hidden');
+  document.getElementById('sim-btn').disabled = false;
+}}
+
+// Close when clicking the dark backdrop (not the panel itself)
+function overlayClick(e) {{
+  if (e.target === document.getElementById('sim-overlay')) closeSimulation();
+}}
+
+async function runSimulation(signal) {{
+  const body    = document.getElementById('sim-body');
+  const progBar = document.getElementById('sim-progress-bar');
+  const counter = document.getElementById('sim-step-counter');
+  const subhead = document.getElementById('sim-header-sub');
+
+  try {{
+    const resp = await fetch('/api/simulate/black-friday', {{
+      method: 'POST',
+      signal,
+    }});
+
+    if (!resp.ok) {{
+      body.innerHTML = `<p style="color:#f85149">⚠ Server error ${{resp.status}}</p>`;
+      document.getElementById('sim-btn').disabled = false;
+      return;
+    }}
+
+    const reader  = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let   buf     = '';
+
+    while (true) {{
+      const {{ done, value }} = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, {{ stream: true }});
+
+      // SSE lines arrive as "data: <json>\\n\\n" — process complete lines
+      const lines = buf.split('\\n');
+      buf = lines.pop();   // keep any incomplete trailing line
+
+      for (const line of lines) {{
+        if (!line.startsWith('data: ')) continue;
+        let evt;
+        try {{ evt = JSON.parse(line.slice(6)); }} catch {{ continue; }}
+        handleSimEvent(evt, body, progBar, counter, subhead);
+      }}
+    }}
+
+  }} catch (err) {{
+    if (err.name === 'AbortError') return;   // user closed the panel
+    const el = document.createElement('p');
+    el.style.color = '#f85149';
+    el.textContent = '⚠ Simulation failed: ' + err.message;
+    body.appendChild(el);
+    document.getElementById('sim-btn').disabled = false;
+  }}
+}}
+
+function handleSimEvent(evt, body, progBar, counter, subhead) {{
+  if (evt.type === 'step_start') {{
+    const pct = ((evt.step - 1) / evt.total * 100).toFixed(1);
+    progBar.style.width = pct + '%';
+    counter.textContent = `Step ${{evt.step}} of ${{evt.total}}`;
+    subhead.textContent = evt.description;
+
+    const stepEl = document.createElement('div');
+    stepEl.className = 'sim-step';
+    stepEl.id = `sim-step-${{evt.step}}`;
+    stepEl.innerHTML =
+      `<div class="sim-step-header">` +
+        `<span class="sim-step-num running" id="sim-num-${{evt.step}}">${{evt.step}}</span>` +
+        `<span class="sim-step-desc">${{escHtml(evt.description)}}</span>` +
+      `</div>` +
+      `<div class="sim-query-bubble">${{escHtml(evt.query).replace(/\\n/g,'<br>')}}</div>` +
+      `<div class="sim-response-bubble thinking" id="sim-resp-${{evt.step}}">Agent is thinking…</div>`;
+    body.appendChild(stepEl);
+    body.scrollTop = body.scrollHeight;
+  }}
+
+  if (evt.type === 'step_end') {{
+    const pct = (evt.step / evt.total * 100).toFixed(1);
+    progBar.style.width = pct + '%';
+    counter.textContent = `Step ${{evt.step}} of ${{evt.total}} complete`;
+
+    const numEl  = document.getElementById(`sim-num-${{evt.step}}`);
+    const respEl = document.getElementById(`sim-resp-${{evt.step}}`);
+
+    if (numEl) {{
+      numEl.className  = 'sim-step-num done';
+      numEl.textContent = '✓';
+    }}
+    if (respEl) {{
+      respEl.classList.remove('thinking');
+      respEl.textContent = evt.response;
+
+      const meta = document.createElement('div');
+      meta.className = 'sim-response-meta';
+      meta.innerHTML =
+        agentTag(evt.agent, evt.agent_name, evt.agent_icon) +
+        `<span>${{evt.latency_ms.toLocaleString()}} ms</span>` +
+        (evt.routing_reason ? `<span style="color:var(--muted);font-style:italic">${{escHtml(evt.routing_reason)}}</span>` : '');
+      respEl.after(meta);
+    }}
+
+    // Mirror active agent in sidebar
+    renderAgentList(evt.agent);
+    body.scrollTop = body.scrollHeight;
+  }}
+
+  if (evt.type === 'error') {{
+    const numEl  = document.getElementById(`sim-num-${{evt.step}}`);
+    const respEl = document.getElementById(`sim-resp-${{evt.step}}`);
+    if (numEl)  {{ numEl.className = 'sim-step-num errored'; numEl.textContent = '✗'; }}
+    if (respEl) {{
+      respEl.classList.remove('thinking');
+      respEl.style.color = '#f85149';
+      respEl.textContent = '⚠ ' + evt.error;
+    }}
+    body.scrollTop = body.scrollHeight;
+  }}
+
+  if (evt.type === 'sim_complete') {{
+    progBar.style.width = '100%';
+    counter.textContent = `All ${{evt.total_steps}} steps complete`;
+    subhead.textContent  = 'Simulation finished';
+
+    const banner = document.createElement('div');
+    banner.className = 'sim-done-banner';
+    banner.innerHTML =
+      `✅ Black Friday simulation complete — ${{evt.total_steps}} queries processed across all agents` +
+      `<small>All spans, metrics and logs exported to Dash0 · Session cleaned up</small>`;
+    body.appendChild(banner);
+    body.scrollTop = body.scrollHeight;
+    document.getElementById('sim-btn').disabled = false;
+    renderAgentList(null);
+    document.getElementById('orch-status').textContent = 'Ready';
   }}
 }}
 </script>

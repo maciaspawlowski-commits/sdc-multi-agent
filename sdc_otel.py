@@ -4,13 +4,15 @@ Signal flow:
   ┌────────────────────────────────────────────────────────────┐
   │  FastAPI HTTP spans       → OTel → Dash0                   │
   │  LangGraph node spans     → OTel → Dash0  (custom spans)   │
-  │  ChatOllama LLM calls     → OTel → Dash0  (LLMetry/LC)     │
+  │  ChatOllama LLM calls     → OTel → Dash0  (SDCOTelCallback)│
+  │  Tool executions          → OTel → Dash0  (SDCToolsCallback)│
   │  Chroma vector queries    → OTel → Dash0  (manual + auto)  │
   │  Metrics (per-agent, etc) → OTel → Dash0                   │
   │  Log records              → OTel → Dash0                   │
   │                                                            │
   │  LangGraph node spans  ──────────────────→ LangSmith       │
   │  ChatOllama LLM calls  ──────────────────→ LangSmith       │
+  │  Tool calls            ──────────────────→ LangSmith       │
   │  (via LANGCHAIN_TRACING_V2 env var — zero extra code)      │
   └────────────────────────────────────────────────────────────┘
 
@@ -20,6 +22,16 @@ Chroma observability — two complementary layers:
   2. Manual spans in vectorstore._query_collection() — adds domain-level
      attributes (sdc.agent, sdc.rag.collection_type, sdc.rag.min_distance,
      sdc.rag.results_after_filter) and records four custom metrics.
+
+Tool observability — SDCToolsCallback:
+  Registered via graph ainvoke config so LangGraph's ToolNode passes it to
+  every tool.invoke() call. Fires on_tool_start / on_tool_end / on_tool_error.
+  Each tool execution produces:
+    • A "tool.invoke" OTel span (child of the active sdc.agent.session span)
+      with: tool.name, sdc.agent, tool.type (rag|domain), tool.input_preview,
+            tool.output_length, tool.latency_ms
+    • sdc.tool.calls.total counter  (by tool, agent, status, type)
+    • sdc.tool.duration_ms histogram (by tool, agent, type)
 
 LangSmith and Dash0 are NOT mutually exclusive:
   • LangChain's callback system fires for LangSmith (graph topology, state diffs, replay)
@@ -32,6 +44,7 @@ import os
 
 from langchain_core.callbacks import BaseCallbackHandler
 from opentelemetry import metrics, trace
+from opentelemetry.trace import SpanKind, StatusCode
 from opentelemetry._logs import set_logger_provider
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.logging import LoggingInstrumentor
@@ -187,6 +200,202 @@ class SDCOTelCallback(BaseCallbackHandler):
             span.record_exception(error)
             span.end()
 
+
+
+# ---------------------------------------------------------------------------
+# Tool name → agent key mapping (used by SDCToolsCallback)
+# ---------------------------------------------------------------------------
+
+_RAG_TOOL_PREFIXES = ("search_runbook_", "search_historical_records_")
+
+_DOMAIN_TOOL_AGENT: dict[str, str] = {
+    # Incident
+    "classify_priority":             "incident",
+    "calculate_resolution_deadline": "incident",
+    "get_escalation_path":           "incident",
+    # Change
+    "check_freeze_window":           "change",
+    "classify_change_type":          "change",
+    "next_cab_meeting":              "change",
+    # Problem
+    "check_problem_trigger":         "problem",
+    "suggest_rca_method":            "problem",
+    "format_kedb_entry":             "problem",
+    # Service
+    "get_request_sla":               "service",
+    "validate_request_fields":       "service",
+    "check_approval_chain":          "service",
+    # SLA
+    "calculate_availability":        "sla",
+    "calculate_sla_credit":          "sla",
+    "sla_breach_warning":            "sla",
+}
+
+
+def _tool_meta(tool_name: str) -> tuple[str, str]:
+    """Return (agent_key, tool_type) for a given tool name.
+
+    tool_type is either 'rag' (search tools) or 'domain' (calculation/lookup tools).
+    """
+    for prefix in _RAG_TOOL_PREFIXES:
+        if tool_name.startswith(prefix):
+            agent = tool_name[len(prefix):]          # e.g. "incident"
+            return agent, "rag"
+
+    agent = _DOMAIN_TOOL_AGENT.get(tool_name, "unknown")
+    return agent, "domain"
+
+
+# ---------------------------------------------------------------------------
+# SDCToolsCallback — OTel instrumentation for tool executions
+# ---------------------------------------------------------------------------
+
+class SDCToolsCallback(BaseCallbackHandler):
+    """LangChain callback handler that creates OTel spans for every tool call.
+
+    Register this via the graph's ainvoke config so LangGraph's ToolNode
+    propagates it to every tool.invoke() call:
+
+        await sdc_graph.ainvoke(state, config={"callbacks": [SDCToolsCallback()]})
+
+    Span hierarchy:
+        sdc.agent.session          (FastAPI handler)
+          └── gen_ai.llm.call      (SDCOTelCallback — LLM reasoning step)
+          └── tool.invoke          (SDCToolsCallback — this class)
+                └── chroma.query   (vectorstore — only for RAG tools)
+
+    Metrics emitted (sdc.tools meter):
+        sdc.tool.calls.total    — counter  (tool_name, agent, tool_type, status)
+        sdc.tool.duration_ms    — histogram (tool_name, agent, tool_type)
+    """
+
+    def __init__(self) -> None:
+        self._spans: dict[str, object] = {}
+        self._start_times: dict[str, float] = {}
+        self._tool_calls_counter: object = None
+        self._tool_duration_hist: object = None
+
+    def _ensure_metrics(self) -> None:
+        if self._tool_calls_counter is None:
+            meter = metrics.get_meter("sdc.tools")
+            self._tool_calls_counter = meter.create_counter(
+                name="sdc.tool.calls.total",
+                description="Total number of agent tool calls",
+                unit="{calls}",
+            )
+            self._tool_duration_hist = meter.create_histogram(
+                name="sdc.tool.duration_ms",
+                description="Tool execution latency in milliseconds",
+                unit="ms",
+            )
+
+    def on_tool_start(
+        self, serialized: dict, input_str: str, **kwargs
+    ) -> None:
+        import time as _time
+        from opentelemetry import context as ctx_api
+
+        tool_name = serialized.get("name", "unknown_tool")
+        agent_key, tool_type = _tool_meta(tool_name)
+
+        tracer = trace.get_tracer("sdc.tools")
+        # Capture the current OTel context so the span is a child of
+        # whatever is active (sdc.agent.session) at invocation time.
+        span = tracer.start_span(
+            "tool.invoke",
+            context=ctx_api.get_current(),
+            attributes={
+                "tool.name":       tool_name,
+                "sdc.agent":       agent_key,
+                "tool.type":       tool_type,           # "rag" | "domain"
+                "tool.input_preview": str(input_str)[:300],
+            },
+        )
+
+        run_id = str(kwargs.get("run_id", ""))
+        self._spans[run_id] = span
+        self._start_times[run_id] = _time.perf_counter()
+
+        logger.debug(
+            "tool.start [%s/%s] input_len=%d",
+            agent_key, tool_name, len(str(input_str)),
+        )
+
+    def on_tool_end(self, output: str, **kwargs) -> None:
+        import time as _time
+
+        run_id = str(kwargs.get("run_id", ""))
+        span = self._spans.pop(run_id, None)
+        t0 = self._start_times.pop(run_id, None)
+
+        if span is None:
+            return
+
+        latency_ms = (_time.perf_counter() - t0) * 1000 if t0 else 0.0
+        output_str = str(output) if output is not None else ""
+        tool_name = span.name  # "tool.invoke" — get attrs from span
+        # Re-read attrs from span for metric labels
+        attrs = dict(span.attributes or {})
+        agent_key  = attrs.get("sdc.agent",  "unknown")
+        tool_type  = attrs.get("tool.type",  "domain")
+        tool_name  = attrs.get("tool.name",  "unknown")
+
+        span.set_attribute("tool.output_length", len(output_str))
+        span.set_attribute("tool.output_preview", output_str[:500])
+        span.set_attribute("tool.latency_ms", round(latency_ms, 2))
+        span.set_status(StatusCode.OK)
+        span.end()
+
+        self._ensure_metrics()
+        metric_attrs = {
+            "tool.name":  tool_name,
+            "sdc.agent":  agent_key,
+            "tool.type":  tool_type,
+            "status":     "ok",
+        }
+        self._tool_calls_counter.add(1, metric_attrs)
+        self._tool_duration_hist.record(latency_ms, metric_attrs)
+
+        logger.debug(
+            "tool.end [%s/%s] latency=%.1fms output_len=%d",
+            agent_key, tool_name, latency_ms, len(output_str),
+        )
+
+    def on_tool_error(self, error: Exception, **kwargs) -> None:
+        import time as _time
+
+        run_id = str(kwargs.get("run_id", ""))
+        span = self._spans.pop(run_id, None)
+        t0 = self._start_times.pop(run_id, None)
+
+        if span is None:
+            return
+
+        latency_ms = (_time.perf_counter() - t0) * 1000 if t0 else 0.0
+        attrs = dict(span.attributes or {})
+        agent_key = attrs.get("sdc.agent", "unknown")
+        tool_type = attrs.get("tool.type", "domain")
+        tool_name = attrs.get("tool.name", "unknown")
+
+        span.record_exception(error)
+        span.set_attribute("tool.latency_ms", round(latency_ms, 2))
+        span.set_status(StatusCode.ERROR, str(error))
+        span.end()
+
+        self._ensure_metrics()
+        metric_attrs = {
+            "tool.name":  tool_name,
+            "sdc.agent":  agent_key,
+            "tool.type":  tool_type,
+            "status":     "error",
+        }
+        self._tool_calls_counter.add(1, metric_attrs)
+        self._tool_duration_hist.record(latency_ms, metric_attrs)
+
+        logger.warning(
+            "tool.error [%s/%s] latency=%.1fms error=%s",
+            agent_key, tool_name, latency_ms, error,
+        )
 
 
 def _log_langsmith_status() -> None:
