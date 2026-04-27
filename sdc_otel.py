@@ -162,14 +162,19 @@ class SDCOTelCallback(BaseCallbackHandler):
     def on_llm_start(self, serialized: dict, prompts: list, **kwargs) -> None:
         import os
         model = os.getenv("LLM_MODEL", "llama3.2")
+        prompt_preview = str(prompts[0])[:200].replace("\n", " ") if prompts else ""
+        logger.info(
+            "sdc.llm.start agent=%s model=%s prompts=%d preview=%.200s",
+            self._agent_key, model, len(prompts), prompt_preview,
+        )
         tracer = trace.get_tracer("sdc-agents")
         span = tracer.start_span(
             "gen_ai.llm.call",
             attributes={
-                "gen_ai.system": "ollama",
+                "gen_ai.system":        "ollama",
                 "gen_ai.request.model": model,
-                "sdc.agent": self._agent_key,
-                "gen_ai.prompt": str(prompts[0])[:2000] if prompts else "",
+                "sdc.agent":            self._agent_key,
+                "gen_ai.prompt":        str(prompts[0])[:2000] if prompts else "",
             },
         )
         run_id = kwargs.get("run_id")
@@ -177,25 +182,46 @@ class SDCOTelCallback(BaseCallbackHandler):
             self._spans[str(run_id)] = span
 
     def on_llm_end(self, response, **kwargs) -> None:
+        import os
         run_id = str(kwargs.get("run_id", ""))
         span = self._spans.pop(run_id, None)
         if span is None:
             return
         try:
             gen = response.generations[0][0] if response.generations else None
+            completion_preview = ""
+            prompt_tokens = completion_tokens = 0
             if gen:
                 span.set_attribute("gen_ai.completion", str(gen.text)[:2000])
+                completion_preview = str(gen.text)[:200].replace("\n", " ")
             if hasattr(response, "llm_output") and response.llm_output:
                 usage = response.llm_output.get("usage", {})
                 if usage:
-                    span.set_attribute("gen_ai.usage.prompt_tokens", usage.get("prompt_tokens", 0))
-                    span.set_attribute("gen_ai.usage.completion_tokens", usage.get("completion_tokens", 0))
+                    prompt_tokens = usage.get("prompt_tokens", 0)
+                    completion_tokens = usage.get("completion_tokens", 0)
+                    span.set_attribute("gen_ai.usage.prompt_tokens", prompt_tokens)
+                    span.set_attribute("gen_ai.usage.completion_tokens", completion_tokens)
+            # Detect tool calls in the raw message if available
+            tool_calls = 0
+            if hasattr(gen, "message") and hasattr(gen.message, "tool_calls"):
+                tool_calls = len(gen.message.tool_calls or [])
+            model = os.getenv("LLM_MODEL", "llama3.2")
+            logger.info(
+                "sdc.llm.end agent=%s model=%s tokens_in=%d tokens_out=%d "
+                "tool_calls=%d preview=%.200s",
+                self._agent_key, model, prompt_tokens, completion_tokens,
+                tool_calls, completion_preview,
+            )
         finally:
             span.end()
 
     def on_llm_error(self, error: Exception, **kwargs) -> None:
         run_id = str(kwargs.get("run_id", ""))
         span = self._spans.pop(run_id, None)
+        logger.error(
+            "sdc.llm.error agent=%s error=%s",
+            self._agent_key, error,
+        )
         if span:
             span.record_exception(error)
             span.end()
@@ -316,9 +342,10 @@ class SDCToolsCallback(BaseCallbackHandler):
         self._spans[run_id] = span
         self._start_times[run_id] = _time.perf_counter()
 
-        logger.debug(
-            "tool.start [%s/%s] input_len=%d",
-            agent_key, tool_name, len(str(input_str)),
+        logger.info(
+            "sdc.tool.start tool=%s agent=%s type=%s input_len=%d input=%.150s",
+            tool_name, agent_key, tool_type, len(str(input_str)),
+            str(input_str)[:150].replace("\n", " "),
         )
 
     def on_tool_end(self, output: str, **kwargs) -> None:
@@ -356,9 +383,10 @@ class SDCToolsCallback(BaseCallbackHandler):
         self._tool_calls_counter.add(1, metric_attrs)
         self._tool_duration_hist.record(latency_ms, metric_attrs)
 
-        logger.debug(
-            "tool.end [%s/%s] latency=%.1fms output_len=%d",
-            agent_key, tool_name, latency_ms, len(output_str),
+        logger.info(
+            "sdc.tool.end tool=%s agent=%s type=%s latency_ms=%.1f output_len=%d output=%.150s",
+            tool_name, agent_key, tool_type, latency_ms, len(output_str),
+            output_str[:150].replace("\n", " "),
         )
 
     def on_tool_error(self, error: Exception, **kwargs) -> None:
@@ -393,8 +421,8 @@ class SDCToolsCallback(BaseCallbackHandler):
         self._tool_duration_hist.record(latency_ms, metric_attrs)
 
         logger.warning(
-            "tool.error [%s/%s] latency=%.1fms error=%s",
-            agent_key, tool_name, latency_ms, error,
+            "sdc.tool.error tool=%s agent=%s type=%s latency_ms=%.1f error=%s",
+            tool_name, agent_key, tool_type, latency_ms, error,
         )
 
 

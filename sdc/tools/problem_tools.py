@@ -4,7 +4,10 @@ Covers: determining whether a problem record is warranted, recommending
 the right RCA technique, and generating a correctly formatted KEDB entry.
 """
 
+import logging
 from langchain_core.tools import tool
+
+logger = logging.getLogger(__name__)
 from .rag_tools import make_rag_tools
 
 
@@ -53,6 +56,10 @@ def check_problem_trigger(
         sla_days = sla_days or 2
 
     if not triggers:
+        logger.info(
+            "sdc.tool.check_problem_trigger incidents=%d days=%d priority=%s same_cause=%s required=False",
+            incident_count, days_window, p, same_root_cause,
+        )
         return (
             f"Problem record NOT required based on current data:\n"
             f"  Incidents: {incident_count} over {days_window} days, highest priority: {p}\n"
@@ -63,6 +70,11 @@ def check_problem_trigger(
             f"\nContinue monitoring. Consider proactive problem record if pattern continues."
         )
 
+    logger.info(
+        "sdc.tool.check_problem_trigger incidents=%d days=%d priority=%s same_cause=%s "
+        "required=True triggers=%d sla_days=%s",
+        incident_count, days_window, p, same_root_cause, len(triggers), sla_days,
+    )
     trigger_str = "\n".join(f"  ✓ {t}" for t in triggers)
     priority_label = {
         1: "Critical (recurring P1 — immediate investigation)",
@@ -104,6 +116,19 @@ def suggest_rca_method(
 
     Returns the recommended technique with rationale, process steps, and output format.
     """
+    method = (
+        "CHANGE ANALYSIS" if is_change_related else
+        "FISHBONE" if multiple_contributing_factors else
+        "FAULT TREE" if incident_count >= 3 else
+        "5-WHYS + VENDOR" if is_vendor_related else
+        "5-WHYS"
+    )
+    logger.info(
+        "sdc.tool.suggest_rca_method method=%s incidents=%d change_related=%s "
+        "vendor=%s multi_factor=%s",
+        method, incident_count, is_change_related, is_vendor_related, multiple_contributing_factors,
+    )
+
     if is_change_related:
         return (
             "Recommended RCA Method: CHANGE ANALYSIS\n"
@@ -219,6 +244,10 @@ def format_kedb_entry(
     services_list = "\n".join(f"- {s.strip()}" for s in affected_services.split(","))
     symptoms_list = "\n".join(f"- {s.strip()}" for s in symptoms.split(";"))
 
+    logger.info(
+        "sdc.tool.format_kedb_entry kedb_id=%s problem_id=%s services=%s fix_eta=%s",
+        kedb_id, problem_id, affected_services.replace("\n", ","), fix_eta,
+    )
     return f"""KEDB Entry — {kedb_id}
 {'='*50}
 KEDB ID: {kedb_id}

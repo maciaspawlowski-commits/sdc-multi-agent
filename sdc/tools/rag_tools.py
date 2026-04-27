@@ -5,7 +5,11 @@ tool pointing at its own Chroma collections. The LLM decides when and
 what to search; retrieval is no longer eager/automatic.
 """
 
+import logging
+
 from langchain_core.tools import tool
+
+logger = logging.getLogger(__name__)
 
 
 def make_rag_tools(agent_key: str) -> list:
@@ -19,8 +23,17 @@ def make_rag_tools(agent_key: str) -> list:
         procedure for handling a situation — e.g. 'how do I classify a P1?',
         'what is the emergency change process?', 'what does a KEDB entry
         contain?'. Returns the most relevant runbook sections."""
+        logger.info(
+            "sdc.rag.query agent=%s collection=runbook query=%.150s",
+            agent_key, query.replace("\n", " "),
+        )
         from sdc.vectorstore import retrieve
         result = retrieve(agent_key, query, k=3)
+        found = bool(result)
+        logger.info(
+            "sdc.rag.result agent=%s collection=runbook found=%s result_len=%d",
+            agent_key, found, len(result) if result else 0,
+        )
         return result if result else "No relevant runbook sections found for that query."
 
     @tool
@@ -32,8 +45,17 @@ def make_rag_tools(agent_key: str) -> list:
         Examples: 'past payment gateway outages', 'previous database disk full
         incidents', 'change rollbacks in 2024', 'SLA breaches in Q3'.
         Returns the most relevant historical records."""
+        logger.info(
+            "sdc.rag.query agent=%s collection=records query=%.150s",
+            agent_key, query.replace("\n", " "),
+        )
         from sdc.vectorstore import retrieve_records
         result = retrieve_records(agent_key, query, k=3)
+        found = bool(result)
+        logger.info(
+            "sdc.rag.result agent=%s collection=records found=%s result_len=%d",
+            agent_key, found, len(result) if result else 0,
+        )
         return result if result else "No matching historical records found for that query."
 
     # Set readable names for observability / LangSmith traces

@@ -6,7 +6,10 @@ and escalation path lookup — all derived from the SDC incident runbook rules.
 """
 
 from datetime import datetime, timedelta
+import logging
 from langchain_core.tools import tool
+
+logger = logging.getLogger(__name__)
 from .rag_tools import make_rag_tools
 
 
@@ -75,6 +78,10 @@ def classify_priority(
         "P4": "99.0%  (max 7.3 hr/month downtime)",
     }[priority]
 
+    logger.info(
+        "sdc.tool.classify_priority service=%s users=%d workaround=%s revenue=%s priority=%s resolution=%s",
+        service_name, users_affected, has_workaround, revenue_impact, priority, resolution,
+    )
     return (
         f"PRIORITY: {priority}\n"
         f"Service: {service_name}\n"
@@ -132,6 +139,11 @@ def calculate_resolution_deadline(priority: str, incident_start_iso: str) -> str
         else f"✓ {remaining_min} minutes remaining"
     )
 
+    logger.info(
+        "sdc.tool.calculate_resolution_deadline priority=%s start=%s deadline=%s remaining_min=%d breached=%s",
+        priority_upper, start.strftime("%Y-%m-%dT%H:%M"), deadline.strftime("%Y-%m-%dT%H:%M"),
+        remaining_min, remaining_min < 0,
+    )
     return (
         f"Priority: {priority_upper}\n"
         f"Incident started: {start.strftime('%Y-%m-%d %H:%M UTC')}\n"
@@ -220,6 +232,10 @@ def get_escalation_path(priority: str) -> str:
 
     info = paths[p]
     chain_str = "\n".join(f"  {step}" for step in info["chain"])
+    logger.info(
+        "sdc.tool.get_escalation_path priority=%s cadence=%s bridge=%s",
+        p, info["cadence"], info["bridge"],
+    )
     return (
         f"Escalation path for {p}:\n"
         f"\nUpdate cadence: {info['cadence']}\n"

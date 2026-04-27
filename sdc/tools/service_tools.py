@@ -5,7 +5,10 @@ request completeness validation — the three most common friction points
 in service request handling.
 """
 
+import logging
 from langchain_core.tools import tool
+
+logger = logging.getLogger(__name__)
 from .rag_tools import make_rag_tools
 
 
@@ -96,6 +99,10 @@ def get_request_sla(request_type: str) -> str:
     else:
         approval = "Line manager approval"
 
+    logger.info(
+        "sdc.tool.get_request_sla type=%s sla_days=%s desc=%s approval=%s",
+        request_type, matched_days, matched_desc, approval,
+    )
     return (
         f"Service Request SLA: {matched_desc}\n"
         f"\nFulfillment target: {sla_str}\n"
@@ -133,6 +140,10 @@ def validate_request_fields(request_type: str, provided_fields_csv: str) -> str:
     missing = [f for f in required if f.lower() not in provided]
 
     if not missing:
+        logger.info(
+            "sdc.tool.validate_request_fields type=%s category=%s complete=True",
+            request_type, category,
+        )
         return (
             f"✓ Request is COMPLETE — all required fields present for '{request_type}'.\n"
             f"\nRequired fields: {', '.join(required)}\n"
@@ -140,6 +151,10 @@ def validate_request_fields(request_type: str, provided_fields_csv: str) -> str:
             f"\nRequest can be assigned for fulfillment."
         )
 
+    logger.info(
+        "sdc.tool.validate_request_fields type=%s category=%s complete=False missing=%d fields=%s",
+        request_type, category, len(missing), ",".join(missing),
+    )
     missing_str = "\n".join(f"  ✗ {f.replace('_', ' ').title()}" for f in missing)
     return (
         f"⚠ Request INCOMPLETE — missing required fields for '{request_type}':\n"
@@ -198,6 +213,10 @@ def check_approval_chain(request_type: str, estimated_cost_gbp: float) -> str:
     approvers_str = "\n".join(f"  {a}" for a in approvers)
     notes_str = "\n".join(f"  • {n}" for n in notes) if notes else "  • Standard approval flow applies."
 
+    logger.info(
+        "sdc.tool.check_approval_chain type=%s cost_gbp=%.0f approver_levels=%d",
+        request_type, estimated_cost_gbp, len(approvers),
+    )
     return (
         f"Approval chain for '{request_type}' (cost: £{estimated_cost_gbp:,.0f}/yr):\n"
         f"\n{approvers_str}\n"

@@ -6,7 +6,10 @@ next available CAB meeting — all derived from the SDC change runbook.
 """
 
 from datetime import date, datetime, timedelta
+import logging
 from langchain_core.tools import tool
+
+logger = logging.getLogger(__name__)
 from .rag_tools import make_rag_tools
 
 
@@ -66,6 +69,10 @@ def check_freeze_window(date_iso: str) -> str:
         if start <= target <= end:
             stricter = "Q4" in reason or "Year-End" in reason or "Christmas" in reason
             approvers = "SDM + CTO + CISO" if stricter else "SDM"
+            logger.info(
+                "sdc.tool.check_freeze_window date=%s frozen=True reason=%s approvers=%s",
+                date_iso, reason, approvers,
+            )
             return (
                 f"⛔ FREEZE WINDOW — {date_iso} is frozen.\n"
                 f"Reason: {reason}\n"
@@ -77,6 +84,7 @@ def check_freeze_window(date_iso: str) -> str:
                 f"\nStandard and Normal changes are NOT permitted."
             )
 
+    logger.info("sdc.tool.check_freeze_window date=%s frozen=False", date_iso)
     return (
         f"✓ {date_iso} is NOT in a freeze window — changes are permitted.\n"
         f"\nFreeze windows for {year}:\n"
@@ -191,6 +199,11 @@ def classify_change_type(
     risk_str = "\n".join(f"  • {f}" for f in risk_factors) if risk_factors else "  • Low risk factors identified"
     docs_str = "\n".join(f"  • {d}" for d in docs)
 
+    logger.info(
+        "sdc.tool.classify_change_type type=%s risk_score=%d services=%d staged=%s data=%s urgent=%s",
+        change_type, risk_score, services_affected_count,
+        tested_in_staging, involves_data_changes, is_urgent_incident_fix,
+    )
     return (
         f"Change Type: {change_type}\n"
         f"\nRisk factors:\n{risk_str}\n"
@@ -238,6 +251,11 @@ def next_cab_meeting(after_date_iso: str, change_type: str = "minor") -> str:
     if xmas_start <= next_cab <= xmas_end:
         freeze_note = "\n⛔ NOTE: This CAB date falls in Christmas freeze — Emergency Changes only."
 
+    logger.info(
+        "sdc.tool.next_cab_meeting after=%s type=%s next_cab=%s deadline=%s frozen=%s",
+        after_date_iso, change_type, next_cab.isoformat(),
+        submission_deadline.isoformat(), bool(freeze_note),
+    )
     return (
         f"Next {change_type.title()} CAB meeting:\n"
         f"  Date: {next_cab.strftime('%A %d %B %Y')} at {cab_time}\n"

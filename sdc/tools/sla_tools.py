@@ -5,7 +5,10 @@ breach penalty/credit amount, and breach urgency status — all based on
 SDC's SLA framework and contract terms.
 """
 
+import logging
 from langchain_core.tools import tool
+
+logger = logging.getLogger(__name__)
 from .rag_tools import make_rag_tools
 
 
@@ -59,6 +62,12 @@ def calculate_availability(
 
     status_icon = "✗ BREACH" if breach else "✓ MET"
 
+    logger.info(
+        "sdc.tool.calculate_availability service=%s downtime_min=%d total_min=%d "
+        "availability=%.4f%% target=%.2f%% breach=%s excess_min=%.1f",
+        service_name, downtime_minutes, total_minutes_in_period,
+        availability_pct, sla_target, breach, breach_excess_min,
+    )
     return (
         f"Availability Report: {service_name}\n"
         f"\nPeriod: {total_minutes_in_period:,} minutes "
@@ -119,6 +128,13 @@ def calculate_sla_credit(
         "MODERATE — standard credit application"
     )
 
+    logger.info(
+        "sdc.tool.calculate_sla_credit service=%s downtime_min=%.1f allowance_min=%.1f "
+        "excess_min=%.1f excess_hours=%.2f rate_gbp=%.2f credit_gbp=%.2f severity=%s",
+        service_name, breach_downtime_minutes, sla_allowance_minutes,
+        excess_min, excess_hours, customer_hourly_rate_gbp, credit,
+        severity.split(" —")[0],
+    )
     return (
         f"SLA Credit Calculation: {service_name}\n"
         f"\nDowntime in period: {breach_downtime_minutes:.1f} minutes\n"
@@ -160,6 +176,12 @@ def sla_breach_warning(priority: str, elapsed_minutes: int) -> str:
     sla_minutes = resolution_minutes[p]
     pct_elapsed = (elapsed_minutes / sla_minutes) * 100
     remaining = sla_minutes - elapsed_minutes
+
+    logger.info(
+        "sdc.tool.sla_breach_warning priority=%s elapsed_min=%d sla_min=%d "
+        "pct_elapsed=%.1f remaining_min=%d breached=%s",
+        p, elapsed_minutes, sla_minutes, pct_elapsed, remaining, pct_elapsed >= 100,
+    )
 
     if pct_elapsed >= 100:
         status = "🔴 SLA BREACHED"
