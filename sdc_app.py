@@ -118,7 +118,13 @@ def ui():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": LLM_MODEL, "agents": list(AGENT_NAMES.keys())}
+    from sdc.vectorstore import collection_stats
+    return {
+        "status": "ok",
+        "model": LLM_MODEL,
+        "agents": list(AGENT_NAMES.keys()),
+        "knowledge_base": collection_stats(),
+    }
 
 
 @app.post("/api/chat", response_model=ChatResponse)

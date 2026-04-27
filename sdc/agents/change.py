@@ -42,7 +42,28 @@ Always gather: change description, affected services, planned date/window, risk 
 
 
 def change_node(state: SDCState) -> dict:
+    from sdc.vectorstore import retrieve_both
+    query = _last_human(state)
+    runbook_ctx, records_ctx = retrieve_both("change", query)
+    system = _augment_dual(SYSTEM_PROMPT, runbook_ctx, records_ctx)
+
     llm = make_llm("change")
-    messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+    messages = [SystemMessage(content=system)] + state["messages"]
     response = llm.invoke(messages)
     return {"messages": [AIMessage(content=response.content, name="change")]}
+
+
+def _last_human(state: SDCState) -> str:
+    for msg in reversed(state["messages"]):
+        if hasattr(msg, "type") and msg.type == "human":
+            return msg.content
+    return ""
+
+
+def _augment_dual(system_prompt: str, runbook_ctx: str, records_ctx: str) -> str:
+    extra = ""
+    if runbook_ctx:
+        extra += "\n\n## Relevant Runbook Guidance\n\n" + runbook_ctx
+    if records_ctx:
+        extra += "\n\n## Relevant Past Changes (Historical Records)\n\n" + records_ctx
+    return system_prompt + extra if extra else system_prompt
