@@ -5,6 +5,7 @@ Signal flow:
   │  FastAPI HTTP spans       → OTel → Dash0                   │
   │  LangGraph node spans     → OTel → Dash0  (custom spans)   │
   │  ChatOllama LLM calls     → OTel → Dash0  (LLMetry/LC)     │
+  │  Chroma vector queries    → OTel → Dash0  (manual + auto)  │
   │  Metrics (per-agent, etc) → OTel → Dash0                   │
   │  Log records              → OTel → Dash0                   │
   │                                                            │
@@ -12,6 +13,13 @@ Signal flow:
   │  ChatOllama LLM calls  ──────────────────→ LangSmith       │
   │  (via LANGCHAIN_TRACING_V2 env var — zero extra code)      │
   └────────────────────────────────────────────────────────────┘
+
+Chroma observability — two complementary layers:
+  1. ChromaInstrumentor (auto) — patches the Chroma Python client and emits
+     spans for every collection.query() call at the client-library level.
+  2. Manual spans in vectorstore._query_collection() — adds domain-level
+     attributes (sdc.agent, sdc.rag.collection_type, sdc.rag.min_distance,
+     sdc.rag.results_after_filter) and records four custom metrics.
 
 LangSmith and Dash0 are NOT mutually exclusive:
   • LangChain's callback system fires for LangSmith (graph topology, state diffs, replay)
@@ -107,6 +115,16 @@ def setup_sdc_telemetry(app=None, service_version: str = "1.0.0") -> None:
     # handler (SDCOTelCallback) that creates equivalent GenAI-semantic spans.
     # Registered per-agent call in sdc/agents/base_llm.py.
     logger.info("LLMetry → using SDCOTelCallback for LangChain spans")
+
+    # ── Chroma auto-instrumentation ───────────────────────────────────────────
+    # Patches chromadb.Collection.query / add / delete at the client level.
+    # Complements the manual spans in vectorstore._query_collection().
+    try:
+        from opentelemetry.instrumentation.chromadb import ChromaInstrumentor
+        ChromaInstrumentor().instrument()
+        logger.info("Chroma  → auto-instrumented (ChromaInstrumentor)")
+    except Exception as exc:
+        logger.warning("Chroma auto-instrumentation unavailable: %s", exc)
 
     # ── FastAPI HTTP layer ────────────────────────────────────────────────────
     if app is not None:

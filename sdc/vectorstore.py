@@ -6,32 +6,90 @@ Two collections per agent:
 
 Both are queried at inference time and combined into the agent's context.
 
+Observability
+-------------
+Every call to _query_collection() produces:
+  • An OTel span   — "chroma.query" with db.* and sdc.rag.* attributes
+  • Histogram      — sdc.rag.query.duration_ms  (latency by agent + collection_type)
+  • Histogram      — sdc.rag.results.count       (results passing relevance filter)
+  • Histogram      — sdc.rag.min_distance        (quality of best embedding match)
+  • Counter        — sdc.rag.empty_results.total (queries that returned nothing useful)
+
+Spans are child spans of whatever is active (i.e. the sdc.agent.session span),
+so every RAG call appears nested inside the correct agent trace in Dash0.
+
 Usage:
     from sdc.vectorstore import retrieve, retrieve_records, retrieve_both
     context = retrieve_both("incident", "connection pool exhaustion P1")
 """
 
 import logging
-import os
+import time
 from pathlib import Path
 from typing import Optional
 
 import chromadb
 from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+from opentelemetry import metrics, trace
+from opentelemetry.trace import SpanKind, StatusCode
 
 logger = logging.getLogger(__name__)
 
 AGENT_KEYS = ("incident", "change", "problem", "service", "sla")
 
-# Persist embeddings alongside the project
 _DB_PATH = str(Path(__file__).parent.parent / "chroma_db")
 
-# Module-level client — one connection, reused across all requests
 _client: Optional[chromadb.PersistentClient] = None
 _embed_fn = DefaultEmbeddingFunction()
 
 _COSINE_THRESHOLD = 0.7  # distance > this → low relevance, filtered out
 
+# ---------------------------------------------------------------------------
+# OTel instruments — obtained lazily so they work after provider initialisation
+# ---------------------------------------------------------------------------
+
+_tracer: Optional[trace.Tracer] = None
+_query_latency: Optional[metrics.Histogram] = None
+_result_count: Optional[metrics.Histogram] = None
+_min_distance: Optional[metrics.Histogram] = None
+_empty_results: Optional[metrics.Counter] = None
+
+
+def _instruments():
+    """Initialise OTel instruments on first use (providers are set up by then)."""
+    global _tracer, _query_latency, _result_count, _min_distance, _empty_results
+    if _tracer is None:
+        _tracer = trace.get_tracer("sdc.vectorstore")
+
+        meter = metrics.get_meter("sdc.vectorstore")
+
+        _query_latency = meter.create_histogram(
+            name="sdc.rag.query.duration_ms",
+            description="Chroma vector query latency in milliseconds",
+            unit="ms",
+        )
+        _result_count = meter.create_histogram(
+            name="sdc.rag.results.count",
+            description="Number of chunks returned after relevance filtering",
+            unit="{chunks}",
+        )
+        _min_distance = meter.create_histogram(
+            name="sdc.rag.min_distance",
+            description="Cosine distance of the closest matching chunk (lower = more relevant)",
+            unit="1",
+        )
+        _empty_results = meter.create_counter(
+            name="sdc.rag.empty_results.total",
+            description="Number of queries that returned zero relevant chunks",
+            unit="{queries}",
+        )
+
+    return _tracer, _query_latency, _result_count, _min_distance, _empty_results
+
+
+# ---------------------------------------------------------------------------
+# Chroma client
+# ---------------------------------------------------------------------------
 
 def _get_client() -> chromadb.PersistentClient:
     global _client
@@ -53,8 +111,8 @@ def records_collection_name(agent_key: str) -> str:
     return f"sdc_records_{agent_key}"
 
 
-# Keep original name for backward compat
 def collection_name(agent_key: str) -> str:
+    """Backward-compat alias for runbook collection name."""
     return runbook_collection_name(agent_key)
 
 
@@ -63,7 +121,6 @@ def collection_name(agent_key: str) -> str:
 # ---------------------------------------------------------------------------
 
 def get_collection(agent_key: str) -> chromadb.Collection:
-    """Return (or create) the runbook collection for the given agent."""
     return _get_client().get_or_create_collection(
         name=runbook_collection_name(agent_key),
         embedding_function=_embed_fn,
@@ -72,7 +129,6 @@ def get_collection(agent_key: str) -> chromadb.Collection:
 
 
 def get_records_collection(agent_key: str) -> chromadb.Collection:
-    """Return (or create) the historical records collection for the given agent."""
     return _get_client().get_or_create_collection(
         name=records_collection_name(agent_key),
         embedding_function=_embed_fn,
@@ -81,24 +137,94 @@ def get_records_collection(agent_key: str) -> chromadb.Collection:
 
 
 # ---------------------------------------------------------------------------
-# Core retrieval helper
+# Core retrieval — single instrumented chokepoint
 # ---------------------------------------------------------------------------
 
-def _query_collection(col: chromadb.Collection, query: str, k: int) -> str:
-    """Query a collection and return filtered, joined document strings."""
+def _query_collection(
+    col: chromadb.Collection,
+    query: str,
+    k: int,
+    agent_key: str,
+    collection_type: str,  # "runbooks" | "records"
+) -> str:
+    """Query a Chroma collection and return filtered, joined document strings.
+
+    Every call is wrapped in an OTel span (child of the active agent session
+    span) and records latency, result count, and relevance quality metrics.
+    """
     if col.count() == 0:
+        logger.debug(
+            "Chroma collection '%s' is empty — skipping RAG retrieval", col.name
+        )
         return ""
 
-    results = col.query(
-        query_texts=[query],
-        n_results=min(k, col.count()),
-        include=["documents", "distances"],
-    )
-    docs = results.get("documents", [[]])[0]
-    distances = results.get("distances", [[]])[0]
+    tracer, lat_hist, res_hist, dist_hist, empty_ctr = _instruments()
 
-    relevant = [doc for doc, dist in zip(docs, distances) if dist < _COSINE_THRESHOLD]
-    return "\n\n---\n\n".join(relevant)
+    metric_attrs = {"sdc.agent": agent_key, "sdc.rag.collection_type": collection_type}
+
+    with tracer.start_as_current_span(
+        "chroma.query",
+        kind=SpanKind.CLIENT,
+        attributes={
+            # DB semantic conventions
+            "db.system": "chromadb",
+            "db.collection.name": col.name,
+            # SDC / RAG domain attributes
+            "sdc.agent": agent_key,
+            "sdc.rag.collection_type": collection_type,
+            "sdc.rag.query_top_k": k,
+            "sdc.rag.query_preview": query[:200],
+            "sdc.rag.collection_size": col.count(),
+        },
+    ) as span:
+        t0 = time.perf_counter()
+        try:
+            results = col.query(
+                query_texts=[query],
+                n_results=min(k, col.count()),
+                include=["documents", "distances"],
+            )
+        except Exception as exc:
+            span.record_exception(exc)
+            span.set_status(StatusCode.ERROR, str(exc))
+            logger.warning(
+                "Chroma query failed [%s / %s]: %s", agent_key, collection_type, exc
+            )
+            raise
+
+        latency_ms = (time.perf_counter() - t0) * 1000
+
+        docs = results.get("documents", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+
+        relevant = [
+            doc for doc, dist in zip(docs, distances) if dist < _COSINE_THRESHOLD
+        ]
+
+        # Best (minimum) distance across all raw candidates
+        best_dist = min(distances) if distances else 1.0
+
+        # Annotate span with result quality
+        span.set_attribute("sdc.rag.candidates_returned", len(docs))
+        span.set_attribute("sdc.rag.results_after_filter", len(relevant))
+        span.set_attribute("sdc.rag.min_distance", round(best_dist, 4))
+        span.set_attribute("sdc.rag.latency_ms", round(latency_ms, 2))
+        span.set_attribute("sdc.rag.result_empty", len(relevant) == 0)
+        span.set_status(StatusCode.OK)
+
+        # Metrics
+        lat_hist.record(latency_ms, metric_attrs)
+        res_hist.record(len(relevant), metric_attrs)
+        dist_hist.record(best_dist, metric_attrs)
+        if not relevant:
+            empty_ctr.add(1, metric_attrs)
+
+        logger.debug(
+            "chroma.query [%s/%s] latency=%.1fms candidates=%d relevant=%d best_dist=%.3f",
+            agent_key, collection_type, latency_ms, len(docs), len(relevant), best_dist,
+        )
+
+        return "\n\n---\n\n".join(relevant)
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +235,7 @@ def retrieve(agent_key: str, query: str, k: int = 4) -> str:
     """Return top-k relevant runbook chunks as a single context string."""
     try:
         col = get_collection(agent_key)
-        return _query_collection(col, query, k)
+        return _query_collection(col, query, k, agent_key, "runbooks")
     except Exception as exc:
         logger.warning("Runbook retrieval failed for '%s': %s", agent_key, exc)
         return ""
@@ -119,7 +245,7 @@ def retrieve_records(agent_key: str, query: str, k: int = 4) -> str:
     """Return top-k relevant historical records as a single context string."""
     try:
         col = get_records_collection(agent_key)
-        return _query_collection(col, query, k)
+        return _query_collection(col, query, k, agent_key, "records")
     except Exception as exc:
         logger.warning("Records retrieval failed for '%s': %s", agent_key, exc)
         return ""
@@ -128,7 +254,7 @@ def retrieve_records(agent_key: str, query: str, k: int = 4) -> str:
 def retrieve_both(agent_key: str, query: str, k: int = 3) -> tuple[str, str]:
     """Return (runbook_context, records_context) for a query.
 
-    Each section uses k results (default 3 each, to keep total context manageable).
+    Each collection uses k results (default 3) — total max context: 6 chunks.
     """
     runbook_ctx = retrieve(agent_key, query, k=k)
     records_ctx = retrieve_records(agent_key, query, k=k)
@@ -140,7 +266,7 @@ def retrieve_both(agent_key: str, query: str, k: int = 3) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 def collection_stats() -> dict:
-    """Return document counts per collection — useful for health checks."""
+    """Return document counts per collection — used by /health endpoint."""
     client = _get_client()
     stats: dict[str, dict] = {}
     for key in AGENT_KEYS:

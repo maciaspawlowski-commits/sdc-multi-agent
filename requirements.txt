@@ -35,3 +35,12 @@ opentelemetry-instrumentation-langchain>=0.60.0
 # LangSmith — activated by env vars only (LANGCHAIN_TRACING_V2 + LANGCHAIN_API_KEY)
 # Already a transitive dep of langchain; listed here for visibility
 langsmith>=0.1.0
+
+# ── RAG: Chroma vector store ────────────────────────────────────────────────
+# Uses built-in onnxruntime embeddings (all-MiniLM-L6-v2) — no model download needed
+chromadb>=1.5.0
+langchain-chroma>=1.1.0
+
+# Chroma OTel auto-instrumentation — patches chromadb.Collection at client level
+# Complements manual spans in sdc/vectorstore.py
+opentelemetry-instrumentation-chromadb>=0.60.0
