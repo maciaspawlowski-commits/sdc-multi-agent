@@ -22,3 +22,16 @@ opentelemetry-instrumentation-httpx>=0.48b0
 
 # Env vars
 python-dotenv>=1.0.0
+
+# ── SDC Multi-Agent System (LangGraph) ─────────────────────────────────────
+langgraph>=1.0.0
+langchain>=1.0.0
+langchain-core>=1.0.0
+langchain-ollama>=1.0.0
+
+# LLMetry for LangChain/LangGraph — captures ChatOllama calls as OTel spans
+opentelemetry-instrumentation-langchain>=0.60.0
+
+# LangSmith — activated by env vars only (LANGCHAIN_TRACING_V2 + LANGCHAIN_API_KEY)
+# Already a transitive dep of langchain; listed here for visibility
+langsmith>=0.1.0
