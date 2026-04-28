@@ -1,0 +1,43 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ollama-pull
+  namespace: sdc
+spec:
+  # Auto-delete 5 minutes after completion so it doesn't clutter kubectl get pods
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        # Wait for Ollama server to be ready before attempting the pull
+        - name: wait-for-ollama
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until wget -qO- http://ollama:11434/api/tags > /dev/null 2>&1; do
+                echo "waiting for ollama..."; sleep 5
+              done
+              echo "ollama ready — starting pull"
+      containers:
+        - name: pull
+          image: curlimages/curl:8.6.0
+          command:
+            - sh
+            - -c
+            - |
+              echo "Pulling llama3.2 model..."
+              curl -sf -X POST http://ollama:11434/api/pull \
+                -H "Content-Type: application/json" \
+                -d '{"name":"llama3.2","stream":false}' \
+                --max-time 600
+              echo "Pull request complete"
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"

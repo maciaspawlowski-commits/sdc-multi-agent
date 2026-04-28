@@ -27,9 +27,10 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, messages_from_dict, messages_to_dict
 from opentelemetry import metrics, trace
 from pydantic import BaseModel
 
@@ -50,12 +51,56 @@ logger = logging.getLogger(__name__)
 APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama3.2")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "86400"))  # 24 h default
 
 # OTel instruments — populated in lifespan
 _tracer: Optional[trace.Tracer] = None
 _agent_counter: Optional[metrics.Counter] = None
 _latency_hist: Optional[metrics.Histogram] = None
 _error_counter: Optional[metrics.Counter] = None
+
+# Redis client — initialised lazily on first use
+_redis: Optional[aioredis.Redis] = None
+
+
+async def _get_redis() -> aioredis.Redis:
+    global _redis
+    if _redis is None:
+        _redis = await aioredis.from_url(REDIS_URL, decode_responses=True)
+    return _redis
+
+
+async def _load_session(session_id: str) -> list:
+    """Load message history from Redis; returns [] if no session exists."""
+    try:
+        r = await _get_redis()
+        raw = await r.get(f"sdc:session:{session_id}")
+        if not raw:
+            return []
+        return messages_from_dict(json.loads(raw))
+    except Exception as exc:
+        logger.warning("session load failed id=%s error=%s — starting fresh", session_id, exc)
+        return []
+
+
+async def _save_session(session_id: str, messages: list) -> None:
+    """Serialise and persist message history to Redis with TTL."""
+    try:
+        r = await _get_redis()
+        payload = json.dumps(messages_to_dict(messages))
+        await r.set(f"sdc:session:{session_id}", payload, ex=SESSION_TTL)
+    except Exception as exc:
+        logger.warning("session save failed id=%s error=%s", session_id, exc)
+
+
+async def _delete_session(session_id: str) -> None:
+    """Remove a session from Redis."""
+    try:
+        r = await _get_redis()
+        await r.delete(f"sdc:session:{session_id}")
+    except Exception as exc:
+        logger.warning("session delete failed id=%s error=%s", session_id, exc)
 
 
 @asynccontextmanager
@@ -84,6 +129,13 @@ async def lifespan(app: FastAPI):
         description="Agent invocation errors",
     )
 
+    # Verify Redis connectivity (non-fatal — app degrades gracefully)
+    try:
+        await (await _get_redis()).ping()
+        logger.info("Redis OK — %s", REDIS_URL)
+    except Exception as exc:
+        logger.warning("Redis unavailable (%s) — sessions will not persist across replicas", exc)
+
     logger.info(
         "SDC Multi-Agent System ready — http://localhost:8000  (model: %s @ %s)",
         LLM_MODEL, OLLAMA_HOST,
@@ -93,10 +145,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="SDC Multi-Agent System", lifespan=lifespan)
-
-# ── In-memory conversation sessions ─────────────────────────────────────────
-# Maps session_id → list of LangChain messages (the conversation history)
-_sessions: dict[str, list] = {}
 
 
 # ── Request / Response models ────────────────────────────────────────────────
@@ -148,7 +196,7 @@ async def chat(req: ChatRequest):
             "sdc.message.length": len(req.message),
         },
     ) as span:
-        history = _sessions.get(session_id, [])
+        history = await _load_session(session_id)
         history.append(HumanMessage(content=req.message))
 
         initial_state = {
@@ -192,7 +240,7 @@ async def chat(req: ChatRequest):
         _latency_hist.record(latency_ms, {**attrs, "status": "ok"})
 
         # Persist full conversation for multi-turn
-        _sessions[session_id] = list(result["messages"])
+        await _save_session(session_id, list(result["messages"]))
 
         logger.info(
             "chat ok session=%s agent=%s model=%s latency_ms=%.0f routing=%s",
@@ -211,8 +259,8 @@ async def chat(req: ChatRequest):
 
 
 @app.delete("/api/session/{session_id}")
-def clear_session(session_id: str):
-    _sessions.pop(session_id, None)
+async def clear_session(session_id: str):
+    await _delete_session(session_id)
     return {"cleared": session_id}
 
 
@@ -246,7 +294,7 @@ async def simulate_black_friday():
 
             # ── run the agent graph ─────────────────────────────────────────
             try:
-                history = _sessions.get(sim_session_id, [])
+                history = await _load_session(sim_session_id)
                 history.append(HumanMessage(content=step["query"]))
 
                 t0 = time.perf_counter()
@@ -261,7 +309,7 @@ async def simulate_black_friday():
                 latency_ms = round((time.perf_counter() - t0) * 1000)
 
                 # Persist growing conversation history
-                _sessions[sim_session_id] = list(result["messages"])
+                await _save_session(sim_session_id, list(result["messages"]))
 
                 ai_msgs = [
                     m for m in result["messages"]
@@ -316,7 +364,7 @@ async def simulate_black_friday():
             await asyncio.sleep(0.3)
 
         # ── all done ─────────────────────────────────────────────────────────
-        _sessions.pop(sim_session_id, None)   # clean up sim session
+        await _delete_session(sim_session_id)  # clean up sim session
         yield (
             "data: "
             + json.dumps({

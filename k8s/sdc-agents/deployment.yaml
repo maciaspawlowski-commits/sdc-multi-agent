@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sdc-agents
+  namespace: sdc
+  labels:
+    app: sdc-agents
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sdc-agents
+  template:
+    metadata:
+      labels:
+        app: sdc-agents
+    spec:
+      initContainers:
+        # Wait for Ollama API to respond before starting the app.
+        # Note: the model still needs to be pulled (make pull-model) separately.
+        - name: wait-for-ollama
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until wget -qO- http://ollama:11434/api/tags > /dev/null 2>&1; do
+                echo "waiting for ollama..."; sleep 5
+              done
+              echo "ollama ready"
+
+        # Wait for ChromaDB heartbeat
+        - name: wait-for-chromadb
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until wget -qO- http://chromadb:8000/api/v2/heartbeat > /dev/null 2>&1; do
+                echo "waiting for chromadb..."; sleep 5
+              done
+              echo "chromadb ready"
+
+        # Wait for Redis
+        - name: wait-for-redis
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z redis 6379; do
+                echo "waiting for redis..."; sleep 3
+              done
+              echo "redis ready"
+
+      containers:
+        - name: sdc-agents
+          image: sdc-agents:latest
+          # Never pull from a registry — use the image built into minikube's daemon.
+          # Change to IfNotPresent + registry path for cloud deployments.
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: sdc-config
+            - secretRef:
+                name: sdc-secrets
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 20

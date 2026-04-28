@@ -44,3 +44,7 @@ langchain-chroma>=1.1.0
 # Chroma OTel auto-instrumentation — patches chromadb.Collection at client level
 # Complements manual spans in sdc/vectorstore.py
 opentelemetry-instrumentation-chromadb>=0.60.0
+
+# ── Session store (K8s multi-replica) ──────────────────────────────────────
+# redis.asyncio is included in the redis package since 4.2.0
+redis>=5.0.0

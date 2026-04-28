@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sdc-config
+  namespace: sdc
+data:
+  # LLM backend
+  OLLAMA_HOST: "http://ollama:11434"
+  LLM_MODEL: "llama3.2"
+
+  # Vector store (ChromaDB server mode)
+  CHROMA_HOST: "chromadb"
+  CHROMA_PORT: "8000"
+
+  # Session store
+  REDIS_URL: "redis://redis:6379"
+  SESSION_TTL_SECONDS: "86400"
+
+  # OpenTelemetry
+  OTEL_SERVICE_NAME: "sdc-agents"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "https://ingress.europe-west4.gcp.dash0.com"
+  ENVIRONMENT: "k8s"
+  APP_VERSION: "3.0.0"
+
+  # LangSmith
+  LANGCHAIN_TRACING_V2: "true"
+  LANGCHAIN_PROJECT: "sdc-agents"
+  LANGSMITH_PROJECT: "sdc-agents"

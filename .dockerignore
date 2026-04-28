@@ -1,0 +1,14 @@
+chroma_db/
+venv/
+.env
+.git/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.md
+architecture.html
+app.py
+processor.py
+otel.py

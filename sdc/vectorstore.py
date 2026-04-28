@@ -24,6 +24,7 @@ Usage:
 """
 
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -33,13 +34,18 @@ from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 from opentelemetry import metrics, trace
 from opentelemetry.trace import SpanKind, StatusCode
 
+# In-cluster: set CHROMA_HOST to the ChromaDB service name (e.g. "chromadb").
+# Unset / empty → falls back to local PersistentClient for dev.
+CHROMA_HOST = os.getenv("CHROMA_HOST", "")
+CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
+
 logger = logging.getLogger(__name__)
 
 AGENT_KEYS = ("incident", "change", "problem", "service", "sla")
 
 _DB_PATH = str(Path(__file__).parent.parent / "chroma_db")
 
-_client: Optional[chromadb.PersistentClient] = None
+_client: Optional[chromadb.Client] = None
 _embed_fn = DefaultEmbeddingFunction()
 
 _COSINE_THRESHOLD = 0.7  # distance > this → low relevance, filtered out
@@ -91,11 +97,15 @@ def _instruments():
 # Chroma client
 # ---------------------------------------------------------------------------
 
-def _get_client() -> chromadb.PersistentClient:
+def _get_client() -> chromadb.Client:
     global _client
     if _client is None:
-        _client = chromadb.PersistentClient(path=_DB_PATH)
-        logger.info("Chroma client initialised — db: %s", _DB_PATH)
+        if CHROMA_HOST:
+            _client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+            logger.info("Chroma HTTP client — %s:%s", CHROMA_HOST, CHROMA_PORT)
+        else:
+            _client = chromadb.PersistentClient(path=_DB_PATH)
+            logger.info("Chroma persistent client — db: %s", _DB_PATH)
     return _client
 
 
