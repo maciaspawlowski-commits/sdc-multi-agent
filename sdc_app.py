@@ -31,9 +31,12 @@ import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from langchain_core.messages import HumanMessage, messages_from_dict, messages_to_dict
-from opentelemetry import metrics, trace
+from opentelemetry import baggage, metrics, trace
+from opentelemetry.context import attach, detach
 from pydantic import BaseModel
 
+from sdc import chaos as chaos_module
+from sdc.chaos import ChaosCallback
 from sdc.graph import sdc_graph
 from sdc.simulation.black_friday import get_black_friday_steps
 from sdc.state import AGENT_ICONS, AGENT_NAMES
@@ -48,7 +51,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
+APP_VERSION = os.getenv("APP_VERSION", "5.0.0")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama3.2")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -179,7 +182,37 @@ def health():
         "model": LLM_MODEL,
         "agents": list(AGENT_NAMES.keys()),
         "knowledge_base": collection_stats(),
+        "chaos": chaos_module.get_state(),
     }
+
+
+# ── Chaos endpoints ──────────────────────────────────────────────────────────
+
+class ChaosRequest(BaseModel):
+    mode: str
+    probability: float = 0.5
+    delay_ms: int = 3000
+
+
+@app.get("/api/chaos")
+def get_chaos():
+    """Return current chaos configuration."""
+    return chaos_module.get_state()
+
+
+@app.post("/api/chaos")
+def set_chaos(req: ChaosRequest):
+    """Activate a chaos mode. Immediately affects all subsequent agent requests."""
+    try:
+        return chaos_module.set_mode(req.mode, req.probability, req.delay_ms)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/chaos")
+def reset_chaos():
+    """Disable chaos — restore normal operation."""
+    return chaos_module.reset()
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -205,10 +238,12 @@ async def chat(req: ChatRequest):
             "routing_reason": None,
         }
 
+        # Propagate session.id via OTel baggage so every child span gets it
+        _baggage_token = attach(baggage.set_baggage("session.id", session_id))
         try:
             result = await sdc_graph.ainvoke(
                 initial_state,
-                config={"callbacks": [_tools_callback]},
+                config={"callbacks": [_tools_callback, ChaosCallback()]},
             )
         except Exception as exc:
             latency_ms = (time.perf_counter() - t0) * 1000
@@ -218,6 +253,8 @@ async def chat(req: ChatRequest):
             _latency_hist.record(latency_ms, {"sdc.agent": "unknown", "status": "error"})
             logger.error("Graph invocation failed session=%s error=%s", session_id, exc)
             raise HTTPException(status_code=502, detail=f"Agent error: {exc}")
+        finally:
+            detach(_baggage_token)
 
         ai_messages = [m for m in result["messages"] if hasattr(m, "type") and m.type == "ai"]
         if not ai_messages:
@@ -298,14 +335,18 @@ async def simulate_black_friday():
                 history.append(HumanMessage(content=step["query"]))
 
                 t0 = time.perf_counter()
-                result = await sdc_graph.ainvoke(
-                    {
-                        "messages":      history,
-                        "current_agent": None,
-                        "routing_reason": None,
-                    },
-                    config={"callbacks": [_tools_callback]},
-                )
+                _sim_token = attach(baggage.set_baggage("session.id", sim_session_id))
+                try:
+                    result = await sdc_graph.ainvoke(
+                        {
+                            "messages":       history,
+                            "current_agent":  None,
+                            "routing_reason": None,
+                        },
+                        config={"callbacks": [_tools_callback, ChaosCallback()]},
+                    )
+                finally:
+                    detach(_sim_token)
                 latency_ms = round((time.perf_counter() - t0) * 1000)
 
                 # Persist growing conversation history
@@ -581,6 +622,43 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; 
   border-radius: 10px; color: #3fb950; font-size: 0.9rem; line-height: 1.7;
 }}
 .sim-done-banner small {{ display: block; color: var(--muted); font-size: 0.75rem; margin-top: 4px; }}
+
+/* ── Chaos panel ── */
+.chaos-toggle-btn {{
+  background: transparent; border: 1px solid var(--border); color: var(--muted);
+  border-radius: 8px; padding: 5px 13px; cursor: pointer; font-size: 0.78rem;
+  font-weight: 600; transition: all .15s; white-space: nowrap;
+}}
+.chaos-toggle-btn:hover {{ border-color: #f85149; color: #f85149; }}
+.chaos-toggle-btn.active {{ background: rgba(248,81,73,.15); border-color: #f85149; color: #f85149; animation: pulse 1.5s ease-in-out infinite; }}
+
+.chaos-panel {{
+  background: var(--surface); border-bottom: 2px solid #f85149;
+  padding: 12px 20px; flex-shrink: 0;
+}}
+.chaos-panel.hidden {{ display: none; }}
+.chaos-panel-inner {{ max-width: 900px; }}
+.chaos-title {{ font-size: 0.85rem; font-weight: 700; color: #f85149; margin-bottom: 2px; }}
+.chaos-subtitle {{ font-size: 0.72rem; color: var(--muted); margin-bottom: 10px; }}
+
+.chaos-modes {{ display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }}
+.chaos-mode-btn {{
+  background: var(--bg); border: 1px solid var(--border); color: var(--muted);
+  border-radius: 6px; padding: 5px 12px; cursor: pointer; font-size: 0.75rem;
+  transition: all .15s;
+}}
+.chaos-mode-btn:hover {{ border-color: var(--text); color: var(--text); }}
+.chaos-mode-btn.active {{ background: rgba(248,81,73,.18); border-color: #f85149; color: #f85149; font-weight: 600; }}
+.chaos-mode-btn.none {{ color: #3fb950; border-color: #238636; }}
+.chaos-mode-btn.none:hover, .chaos-mode-btn.none.active {{ background: rgba(63,185,80,.12); border-color: #3fb950; color: #3fb950; }}
+
+.chaos-options {{ display: flex; gap: 20px; align-items: center; margin-bottom: 8px; font-size: 0.75rem; color: var(--muted); }}
+.chaos-options label {{ display: flex; align-items: center; gap: 8px; }}
+.chaos-options input[type=range] {{ width: 100px; }}
+.chaos-options input[type=number] {{ background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text); padding: 3px 6px; width: 80px; font-size: 0.75rem; }}
+
+.chaos-status {{ font-size: 0.72rem; color: var(--muted); font-style: italic; min-height: 16px; }}
+.chaos-status.on {{ color: #f85149; font-style: normal; font-weight: 600; }}
 </style>
 </head>
 <body>
@@ -595,6 +673,23 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; 
   <button class="sim-btn" id="sim-btn" onclick="openSimulation()" title="Run a scripted Black Friday incident scenario through all five agents">
     🛒 Black Friday Sim
   </button>
+  <button class="chaos-toggle-btn" id="chaos-btn" onclick="toggleChaosPanel()" title="Inject failures to test observability">
+    🔥 Chaos
+  </button>
+</div>
+
+<!-- Chaos control panel (inline dropdown) -->
+<div class="chaos-panel hidden" id="chaos-panel">
+  <div class="chaos-panel-inner">
+    <div class="chaos-title">🔥 Chaos Engineering</div>
+    <div class="chaos-subtitle">Inject failures — watch them appear in Dash0</div>
+    <div class="chaos-modes" id="chaos-modes"></div>
+    <div class="chaos-options" id="chaos-options" style="display:none">
+      <label>Probability <input type="range" id="chaos-prob" min="0" max="100" value="50"> <span id="chaos-prob-val">50%</span></label>
+      <label>Delay (ms) <input type="number" id="chaos-delay" value="3000" min="500" max="15000" step="500"></label>
+    </div>
+    <div class="chaos-status" id="chaos-status"></div>
+  </div>
 </div>
 
 <div class="layout">
@@ -970,6 +1065,84 @@ function handleSimEvent(evt, body, progBar, counter, subhead) {{
     document.getElementById('orch-status').textContent = 'Ready';
   }}
 }}
+
+// ── Chaos panel ──────────────────────────────────────────────────────────────
+
+const CHAOS_MODES = [
+  {{ id: 'none',         label: '✅ None (normal)',       hasOptions: false }},
+  {{ id: 'llm_slow',    label: '🐢 LLM Slow',             hasOptions: true  }},
+  {{ id: 'llm_error',   label: '💥 LLM Error',            hasOptions: true  }},
+  {{ id: 'tool_error',  label: '🔧 Tool Error',            hasOptions: true  }},
+  {{ id: 'rag_degraded',label: '🕳  RAG Degraded',         hasOptions: false }},
+];
+
+let chaosOpen = false;
+let currentChaosMode = 'none';
+
+function toggleChaosPanel() {{
+  chaosOpen = !chaosOpen;
+  document.getElementById('chaos-panel').classList.toggle('hidden', !chaosOpen);
+  if (chaosOpen) renderChaosModes();
+}}
+
+function renderChaosModes() {{
+  const container = document.getElementById('chaos-modes');
+  container.innerHTML = CHAOS_MODES.map(m =>
+    `<button class="chaos-mode-btn ${{m.id}} ${{currentChaosMode === m.id ? 'active' : ''}}"
+       onclick="selectChaosMode('${{m.id}}', ${{m.hasOptions}})">${{m.label}}</button>`
+  ).join('');
+}}
+
+function selectChaosMode(mode, hasOptions) {{
+  document.getElementById('chaos-options').style.display = hasOptions ? 'flex' : 'none';
+  document.querySelectorAll('.chaos-mode-btn').forEach(b =>
+    b.classList.toggle('active', b.classList.contains(mode))
+  );
+  applyChaos(mode);
+}}
+
+async function applyChaos(mode) {{
+  const prob  = parseInt(document.getElementById('chaos-prob')?.value  ?? 50) / 100;
+  const delay = parseInt(document.getElementById('chaos-delay')?.value ?? 3000);
+  try {{
+    let res;
+    if (mode === 'none') {{
+      res = await fetch('/api/chaos', {{ method: 'DELETE' }});
+    }} else {{
+      res = await fetch('/api/chaos', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{ mode, probability: prob, delay_ms: delay }}),
+      }});
+    }}
+    const data = await res.json();
+    currentChaosMode = data.mode;
+    renderChaosModes();
+
+    const btn    = document.getElementById('chaos-btn');
+    const status = document.getElementById('chaos-status');
+    if (data.active) {{
+      btn.classList.add('active');
+      btn.textContent = `🔥 Chaos: ${{data.mode}}`;
+      status.className = 'chaos-status on';
+      status.textContent = `Active: ${{data.description}} — spans will appear in Dash0 as chaos.* errors`;
+    }} else {{
+      btn.classList.remove('active');
+      btn.textContent = '🔥 Chaos';
+      status.className = 'chaos-status';
+      status.textContent = 'Off — normal operation';
+    }}
+  }} catch(e) {{
+    document.getElementById('chaos-status').textContent = 'Error: ' + e.message;
+  }}
+}}
+
+// Wire up probability slider display
+document.addEventListener('DOMContentLoaded', () => {{
+  const slider = document.getElementById('chaos-prob');
+  const label  = document.getElementById('chaos-prob-val');
+  if (slider) slider.addEventListener('input', () => {{ label.textContent = slider.value + '%'; }});
+}});
 </script>
 </body>
 </html>"""

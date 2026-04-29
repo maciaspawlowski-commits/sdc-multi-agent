@@ -31,7 +31,7 @@ from typing import Optional
 
 import chromadb
 from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
-from opentelemetry import metrics, trace
+from opentelemetry import baggage, metrics, trace
 from opentelemetry.trace import SpanKind, StatusCode
 
 # In-cluster: set CHROMA_HOST to the ChromaDB service name (e.g. "chromadb").
@@ -48,7 +48,8 @@ _DB_PATH = str(Path(__file__).parent.parent / "chroma_db")
 _client: Optional[chromadb.Client] = None
 _embed_fn = DefaultEmbeddingFunction()
 
-_COSINE_THRESHOLD = 0.7  # distance > this → low relevance, filtered out
+_COSINE_THRESHOLD    = 0.7   # distance > this → low relevance, filtered out
+_LOW_CONF_THRESHOLD  = 0.45  # distance in (0.45, 0.7) → result passes but confidence is shaky
 
 # ---------------------------------------------------------------------------
 # OTel instruments — obtained lazily so they work after provider initialisation
@@ -59,11 +60,12 @@ _query_latency: Optional[metrics.Histogram] = None
 _result_count: Optional[metrics.Histogram] = None
 _min_distance: Optional[metrics.Histogram] = None
 _empty_results: Optional[metrics.Counter] = None
+_low_confidence: Optional[metrics.Counter] = None
 
 
 def _instruments():
     """Initialise OTel instruments on first use (providers are set up by then)."""
-    global _tracer, _query_latency, _result_count, _min_distance, _empty_results
+    global _tracer, _query_latency, _result_count, _min_distance, _empty_results, _low_confidence
     if _tracer is None:
         _tracer = trace.get_tracer("sdc.vectorstore")
 
@@ -89,8 +91,13 @@ def _instruments():
             description="Number of queries that returned zero relevant chunks",
             unit="{queries}",
         )
+        _low_confidence = meter.create_counter(
+            name="sdc.rag.low_confidence.total",
+            description="RAG queries where best match distance is in the shaky zone (0.45–0.70)",
+            unit="{queries}",
+        )
 
-    return _tracer, _query_latency, _result_count, _min_distance, _empty_results
+    return _tracer, _query_latency, _result_count, _min_distance, _empty_results, _low_confidence
 
 
 # ---------------------------------------------------------------------------
@@ -162,15 +169,24 @@ def _query_collection(
     Every call is wrapped in an OTel span (child of the active agent session
     span) and records latency, result count, and relevance quality metrics.
     """
+    # Chaos: rag_degraded mode forces empty results to simulate missing embeddings
+    from sdc.chaos import is_rag_degraded
+    if is_rag_degraded():
+        logger.warning("🔥 Chaos: rag_degraded — returning empty results for '%s'", col.name)
+        return ""
+
     if col.count() == 0:
         logger.debug(
             "Chroma collection '%s' is empty — skipping RAG retrieval", col.name
         )
         return ""
 
-    tracer, lat_hist, res_hist, dist_hist, empty_ctr = _instruments()
+    tracer, lat_hist, res_hist, dist_hist, empty_ctr, low_conf_ctr = _instruments()
 
     metric_attrs = {"sdc.agent": agent_key, "sdc.rag.collection_type": collection_type}
+
+    # Read session.id from OTel baggage so it appears on every RAG span
+    session_id = baggage.get_baggage("session.id") or ""
 
     with tracer.start_as_current_span(
         "chroma.query",
@@ -185,6 +201,7 @@ def _query_collection(
             "sdc.rag.query_top_k": k,
             "sdc.rag.query_preview": query[:200],
             "sdc.rag.collection_size": col.count(),
+            **({"session.id": session_id} if session_id else {}),
         },
     ) as span:
         t0 = time.perf_counter()
@@ -214,20 +231,35 @@ def _query_collection(
         # Best (minimum) distance across all raw candidates
         best_dist = min(distances) if distances else 1.0
 
+        # Classify confidence level for span attribute + low_confidence metric
+        if best_dist < 0.3:
+            confidence_level = "high"
+        elif best_dist < _LOW_CONF_THRESHOLD:
+            confidence_level = "medium"
+        elif best_dist < _COSINE_THRESHOLD:
+            confidence_level = "low"
+        else:
+            confidence_level = "miss"
+
         # Annotate span with result quality
         span.set_attribute("sdc.rag.candidates_returned", len(docs))
         span.set_attribute("sdc.rag.results_after_filter", len(relevant))
         span.set_attribute("sdc.rag.min_distance", round(best_dist, 4))
+        span.set_attribute("sdc.rag.confidence_level", confidence_level)
+        span.set_attribute("sdc.rag.quality_score", round(1.0 - best_dist, 4))
         span.set_attribute("sdc.rag.latency_ms", round(latency_ms, 2))
         span.set_attribute("sdc.rag.result_empty", len(relevant) == 0)
         span.set_status(StatusCode.OK)
 
         # Metrics
+        conf_attrs = {**metric_attrs, "sdc.rag.confidence_level": confidence_level}
         lat_hist.record(latency_ms, metric_attrs)
         res_hist.record(len(relevant), metric_attrs)
         dist_hist.record(best_dist, metric_attrs)
         if not relevant:
             empty_ctr.add(1, metric_attrs)
+        if _LOW_CONF_THRESHOLD <= best_dist < _COSINE_THRESHOLD:
+            low_conf_ctr.add(1, conf_attrs)
 
         logger.debug(
             "chroma.query [%s/%s] latency=%.1fms candidates=%d relevant=%d best_dist=%.3f",

@@ -38,3 +38,10 @@ spec:
             limits:
               memory: "1Gi"
               cpu: "500m"
+          volumeMounts:
+            - name: embedding-cache
+              mountPath: /root/.cache/chroma
+      volumes:
+        - name: embedding-cache
+          persistentVolumeClaim:
+            claimName: embedding-cache

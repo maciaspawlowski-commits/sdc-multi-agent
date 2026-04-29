@@ -31,7 +31,7 @@ import time
 from functools import wraps
 from typing import Callable
 
-from opentelemetry import trace
+from opentelemetry import baggage, trace
 
 from ..state import SDCState
 
@@ -60,6 +60,7 @@ def graph_node_span(node_name: str, node_type: str = "agent") -> Callable:
                 node_name, node_type, n_messages,
             )
 
+            session_id = baggage.get_baggage("session.id") or ""
             t0 = time.perf_counter()
             with tracer.start_as_current_span(
                 "sdc.graph.node",
@@ -67,6 +68,7 @@ def graph_node_span(node_name: str, node_type: str = "agent") -> Callable:
                     "sdc.node.name":           node_name,
                     "sdc.node.type":           node_type,
                     "sdc.messages.in_context": n_messages,
+                    **({"session.id": session_id} if session_id else {}),
                 },
             ):
                 try:
@@ -125,6 +127,7 @@ def make_instrumented_tool_node(tools: list, node_name: str) -> Callable:
             node_name, pending, ",".join(tool_names) or "none",
         )
 
+        session_id = baggage.get_baggage("session.id") or ""
         t0 = time.perf_counter()
         with tracer.start_as_current_span(
             "sdc.graph.node",
@@ -132,6 +135,7 @@ def make_instrumented_tool_node(tools: list, node_name: str) -> Callable:
                 "sdc.node.name":          node_name,
                 "sdc.node.type":          "tool_executor",
                 "sdc.node.pending_calls": pending,
+                **({"session.id": session_id} if session_id else {}),
             },
         ):
             try:

@@ -1,0 +1,54 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: sdc-canary
+  namespace: sdc
+  labels:
+    app: sdc-canary
+    component: synthetic-monitoring
+spec:
+  # Fire every 10 minutes — llama3.2 on CPU needs ~4-5 min per session
+  schedule: "*/10 * * * *"
+  # Never run two probes at once — if the app is slow, let the previous job finish
+  concurrencyPolicy: Forbid
+  # Keep the last 3 successes and failures for log inspection
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Don't retry — a failure IS the signal; retrying masks it
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: sdc-canary
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: canary
+              image: sdc-agents:latest
+              imagePullPolicy: Never
+              command: ["python", "-m", "sdc.canary"]
+              envFrom:
+                - configMapRef:
+                    name: sdc-config
+                - secretRef:
+                    name: sdc-secrets
+              env:
+                # Override service name so canary traffic is separate in Dash0
+                - name: OTEL_SERVICE_NAME
+                  value: "sdc-canary"
+                # Internal cluster URL — no port-forward needed
+                - name: SVC_URL
+                  value: "http://sdc-agents:8000"
+                - name: CANARY_TIMEOUT_SECS
+                  value: "360"
+                - name: CANARY_QUESTION
+                  value: "What is the SLA target and escalation path for a P1 incident?"
+              resources:
+                requests:
+                  memory: "256Mi"
+                  cpu: "100m"
+                limits:
+                  memory: "512Mi"
+                  cpu: "250m"

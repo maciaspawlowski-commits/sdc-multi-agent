@@ -43,7 +43,7 @@ import logging
 import os
 
 from langchain_core.callbacks import BaseCallbackHandler
-from opentelemetry import metrics, trace
+from opentelemetry import baggage, metrics, trace
 from opentelemetry.trace import SpanKind, StatusCode
 from opentelemetry._logs import set_logger_provider
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
@@ -52,6 +52,10 @@ from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor, ConsoleLogExporter
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import ConsoleMetricExporter, PeriodicExportingMetricReader
+try:
+    from opentelemetry.sdk.metrics._internal.exemplar import TraceBasedExemplarFilter as _ExemplarFilter
+except ImportError:  # SDK < 1.27 fallback
+    _ExemplarFilter = None
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
@@ -59,7 +63,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExport
 logger = logging.getLogger(__name__)
 
 
-def setup_sdc_telemetry(app=None, service_version: str = "1.0.0") -> None:
+def setup_sdc_telemetry(app=None, service_version: str = "5.0.0") -> None:
     """Configure OTel providers and attach all instrumentors for the SDC app."""
 
     endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "").rstrip("/")
@@ -103,7 +107,14 @@ def setup_sdc_telemetry(app=None, service_version: str = "1.0.0") -> None:
         logger.info("Metrics → console")
 
     reader = PeriodicExportingMetricReader(metric_exporter, export_interval_millis=15_000)
-    meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
+    # TraceBasedExemplarFilter: histogram buckets recorded inside an active span
+    # automatically carry the span's trace_id + span_id — one click in Dash0
+    # jumps from a latency spike on the chart directly to the trace that caused it.
+    meter_provider = MeterProvider(
+        resource=resource,
+        metric_readers=[reader],
+        **({'exemplar_filter': _ExemplarFilter()} if _ExemplarFilter else {}),
+    )
     metrics.set_meter_provider(meter_provider)
 
     # ── Logs ─────────────────────────────────────────────────────────────────
@@ -158,15 +169,42 @@ class SDCOTelCallback(BaseCallbackHandler):
     def __init__(self, agent_key: str):
         self._agent_key = agent_key
         self._spans: dict = {}
+        self._t0: dict = {}
+        # GenAI semantic convention metrics (OTel spec names)
+        self._operation_duration_hist: object = None   # gen_ai.client.operation.duration
+        self._token_usage_hist: object = None           # gen_ai.client.token.usage
+        self._requests_counter: object = None           # gen_ai.client.requests.total (custom)
+
+    def _ensure_llm_metrics(self) -> None:
+        if self._operation_duration_hist is None:
+            meter = metrics.get_meter("gen_ai")
+            # Standard OTel GenAI semantic convention metrics
+            # https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/
+            self._operation_duration_hist = meter.create_histogram(
+                name="gen_ai.client.operation.duration",
+                description="Duration of GenAI operation from the client's perspective",
+                unit="s",  # seconds — per OTel GenAI spec
+            )
+            self._token_usage_hist = meter.create_histogram(
+                name="gen_ai.client.token.usage",
+                description="Measures number of input and output tokens used",
+                unit="{token}",
+            )
+            self._requests_counter = meter.create_counter(
+                name="gen_ai.client.requests.total",
+                description="Total number of GenAI client requests by agent and status",
+                unit="{request}",
+            )
 
     def on_llm_start(self, serialized: dict, prompts: list, **kwargs) -> None:
-        import os
+        import os, time as _time
         model = os.getenv("LLM_MODEL", "llama3.2")
         prompt_preview = str(prompts[0])[:200].replace("\n", " ") if prompts else ""
         logger.info(
             "sdc.llm.start agent=%s model=%s prompts=%d preview=%.200s",
             self._agent_key, model, len(prompts), prompt_preview,
         )
+        session_id = baggage.get_baggage("session.id") or ""
         tracer = trace.get_tracer("sdc-agents")
         span = tracer.start_span(
             "gen_ai.llm.call",
@@ -175,18 +213,27 @@ class SDCOTelCallback(BaseCallbackHandler):
                 "gen_ai.request.model": model,
                 "sdc.agent":            self._agent_key,
                 "gen_ai.prompt":        str(prompts[0])[:2000] if prompts else "",
+                **({"session.id": session_id} if session_id else {}),
             },
         )
         run_id = kwargs.get("run_id")
         if run_id:
             self._spans[str(run_id)] = span
+            self._t0[str(run_id)] = _time.perf_counter()
 
     def on_llm_end(self, response, **kwargs) -> None:
-        import os
+        import os, time as _time
+        from opentelemetry import context as ctx_api
+
         run_id = str(kwargs.get("run_id", ""))
         span = self._spans.pop(run_id, None)
+        t0   = self._t0.pop(run_id, None)
         if span is None:
             return
+
+        latency_s  = (_time.perf_counter() - t0) if t0 else 0.0
+        latency_ms = latency_s * 1000
+
         try:
             gen = response.generations[0][0] if response.generations else None
             completion_preview = ""
@@ -194,37 +241,89 @@ class SDCOTelCallback(BaseCallbackHandler):
             if gen:
                 span.set_attribute("gen_ai.completion", str(gen.text)[:2000])
                 completion_preview = str(gen.text)[:200].replace("\n", " ")
+            prompts_raw = kwargs.get("prompts", [])
+            prompt_text = str(prompts_raw[0]) if prompts_raw else (str(response.generations[0][0].message) if response.generations else "")
             if hasattr(response, "llm_output") and response.llm_output:
                 usage = response.llm_output.get("usage", {})
                 if usage:
-                    prompt_tokens = usage.get("prompt_tokens", 0)
+                    prompt_tokens     = usage.get("prompt_tokens", 0)
                     completion_tokens = usage.get("completion_tokens", 0)
-                    span.set_attribute("gen_ai.usage.prompt_tokens", prompt_tokens)
-                    span.set_attribute("gen_ai.usage.completion_tokens", completion_tokens)
+            # Ollama often returns 0 — fall back to char-length / 4 (rough tiktoken estimate)
+            if not prompt_tokens:
+                prompt_tokens = max(1, len(prompt_text) // 4)
+            if not completion_tokens and gen:
+                completion_tokens = max(1, len(str(gen.text)) // 4)
+            span.set_attribute("gen_ai.usage.input_tokens",  prompt_tokens)
+            span.set_attribute("gen_ai.usage.output_tokens", completion_tokens)
+            span.set_attribute("gen_ai.client.operation.duration", round(latency_s, 3))
             # Detect tool calls in the raw message if available
             tool_calls = 0
-            if hasattr(gen, "message") and hasattr(gen.message, "tool_calls"):
+            if gen and hasattr(gen, "message") and hasattr(gen.message, "tool_calls"):
                 tool_calls = len(gen.message.tool_calls or [])
             model = os.getenv("LLM_MODEL", "llama3.2")
             logger.info(
                 "sdc.llm.end agent=%s model=%s tokens_in=%d tokens_out=%d "
-                "tool_calls=%d preview=%.200s",
+                "tool_calls=%d latency_ms=%.0f preview=%.200s",
                 self._agent_key, model, prompt_tokens, completion_tokens,
-                tool_calls, completion_preview,
+                tool_calls, latency_ms, completion_preview,
             )
+
+            # ── GenAI metrics (OTel semantic conventions) ─────────────────────
+            # Attach the gen_ai.llm.call span as the active context so the
+            # TraceBasedExemplarFilter links each histogram bucket to this exact
+            # LLM call span — one click from a latency spike → the full trace.
+            self._ensure_llm_metrics()
+            base_attrs = {
+                "gen_ai.system":         "ollama",
+                "gen_ai.request.model":  model,
+                "gen_ai.operation.name": "chat",
+                "sdc.agent":             self._agent_key,
+            }
+            ctx_token = ctx_api.attach(trace.set_span_in_context(span))
+            try:
+                # gen_ai.client.operation.duration — standard duration histogram (seconds)
+                self._operation_duration_hist.record(latency_s, base_attrs)
+
+                # gen_ai.client.token.usage — input + output tokens as separate data points
+                # (uses Ollama's reported counts when available, char/4 estimate otherwise)
+                self._token_usage_hist.record(
+                    prompt_tokens,
+                    {**base_attrs, "gen_ai.token.type": "input"},
+                )
+                self._token_usage_hist.record(
+                    completion_tokens,
+                    {**base_attrs, "gen_ai.token.type": "output"},
+                )
+
+                # gen_ai.client.requests.total — count by agent + status
+                self._requests_counter.add(1, {**base_attrs, "status": "ok"})
+            finally:
+                ctx_api.detach(ctx_token)
         finally:
             span.end()
 
     def on_llm_error(self, error: Exception, **kwargs) -> None:
         run_id = str(kwargs.get("run_id", ""))
         span = self._spans.pop(run_id, None)
+        t0 = self._t0.pop(run_id, None)
+        import os, time as _time
+        latency_s = (_time.perf_counter() - t0) if t0 else 0.0
+        model = os.getenv("LLM_MODEL", "llama3.2")
         logger.error(
-            "sdc.llm.error agent=%s error=%s",
-            self._agent_key, error,
+            "sdc.llm.error agent=%s model=%s latency_ms=%.0f error=%s",
+            self._agent_key, model, latency_s * 1000, error,
         )
         if span:
             span.record_exception(error)
             span.end()
+        self._ensure_llm_metrics()
+        self._requests_counter.add(1, {
+            "gen_ai.system":         "ollama",
+            "gen_ai.request.model":  model,
+            "gen_ai.operation.name": "chat",
+            "sdc.agent":             self._agent_key,
+            "status":                "error",
+        })
 
 
 
@@ -324,6 +423,7 @@ class SDCToolsCallback(BaseCallbackHandler):
         tool_name = serialized.get("name", "unknown_tool")
         agent_key, tool_type = _tool_meta(tool_name)
 
+        session_id = baggage.get_baggage("session.id") or ""
         tracer = trace.get_tracer("sdc.tools")
         # Capture the current OTel context so the span is a child of
         # whatever is active (sdc.agent.session) at invocation time.
@@ -331,10 +431,11 @@ class SDCToolsCallback(BaseCallbackHandler):
             "tool.invoke",
             context=ctx_api.get_current(),
             attributes={
-                "tool.name":       tool_name,
-                "sdc.agent":       agent_key,
-                "tool.type":       tool_type,           # "rag" | "domain"
+                "tool.name":          tool_name,
+                "sdc.agent":          agent_key,
+                "tool.type":          tool_type,           # "rag" | "domain"
                 "tool.input_preview": str(input_str)[:300],
+                **({"session.id": session_id} if session_id else {}),
             },
         )
 
