@@ -63,6 +63,21 @@ const api = {
     if (!res.ok) return null;
     return res.json();
   },
+  async listSessions(limit = 50) {
+    const res = await fetch(`/api/sessions?limit=${limit}`);
+    if (!res.ok) return { sessions: [] };
+    return res.json();
+  },
+  async getSessionMessages(sessionId) {
+    const res = await fetch(`/api/session/${encodeURIComponent(sessionId)}/messages`);
+    if (!res.ok) return { messages: [] };
+    return res.json();
+  },
+  async getStats() {
+    const res = await fetch('/api/stats');
+    if (!res.ok) return null;
+    return res.json();
+  },
   // Stream the Black Friday SSE response from POST /api/simulate/black-friday.
   async streamSimulation(onEvent, signal) {
     const res = await fetch('/api/simulate/black-friday', {
@@ -129,7 +144,19 @@ function TopBar({ view, setView, chaosMode, chaosOpen, onChaosToggle, onSimOpen 
   );
 }
 
-function Rail({ activeSession, setActiveSession, activeAgent }) {
+function relativeTime(ts) {
+  if (!ts) return '—';
+  const ms = Date.now() - ts * 1000;
+  if (ms < 0)        return 'just now';
+  if (ms < 60_000)   return `${Math.max(1, Math.floor(ms/1000))}s`;
+  if (ms < 3600_000) return `${Math.floor(ms/60_000)}m`;
+  if (ms < 86400_000) return `${Math.floor(ms/3600_000)}h`;
+  return `${Math.floor(ms/86400_000)}d`;
+}
+
+function Rail({ sessions, activeSession, onPickSession, activeAgent, stats }) {
+  const list = sessions && sessions.length ? sessions : null;
+  const total = list ? list.length : 0;
   return (
     <aside className="rail">
       <div className="rail-section">Specialist agents <span/></div>
@@ -137,6 +164,7 @@ function Rail({ activeSession, setActiveSession, activeAgent }) {
         {window.AGENTS.filter(a=>a.id!=='orchestrator').map(a => {
           const I = Icon[a.id];
           const active = activeAgent === a.id;
+          const calls = stats?.byAgent?.[a.id] || 0;
           return (
             <div key={a.id} className="agent-row" data-active={active} style={{['--agent-color']:a.color, ['--agent-bg']:a.bg}}>
               <span className="agent-glyph"><I/></span>
@@ -144,24 +172,33 @@ function Rail({ activeSession, setActiveSession, activeAgent }) {
                 <div className="agent-name">{a.name}</div>
                 <div className="agent-meta">{a.desc}</div>
               </div>
-              <span className="agent-pill">{active ? 'active' : `${window.AGENT_TOOL_COUNTS[a.id]||0}t`}</span>
+              <span className="agent-pill">{active ? 'active' : (calls > 0 ? `${calls} call${calls===1?'':'s'}` : `${window.AGENT_TOOL_COUNTS[a.id]||0}t`)}</span>
             </div>
           );
         })}
       </div>
 
-      <div className="rail-section">Sessions <span style={{fontFamily:"'JetBrains Mono', monospace", color:'var(--fg-3)'}}>{window.SESSIONS.length}</span></div>
+      <div className="rail-section">Sessions <span style={{fontFamily:"'JetBrains Mono', monospace", color:'var(--fg-3)'}}>{total}</span></div>
       <div className="sessions-list">
-        {window.SESSIONS.map(s => {
-          const a = window.AGENTS.find(x=>x.id===s.agent) || {};
+        {!list && (
+          <div className="session-row" style={{opacity:.6, cursor:'default'}}>
+            <span className="session-dot" />
+            <div style={{minWidth:0}}>
+              <div className="session-title">No sessions yet</div>
+              <div className="session-meta">send a message to create one</div>
+            </div>
+          </div>
+        )}
+        {list && list.map(s => {
+          const a = window.AGENTS.find(x=>x.id===s.last_agent) || {};
           return (
-            <div key={s.id} className="session-row" data-active={activeSession===s.id} onClick={()=>setActiveSession(s.id)}>
+            <div key={s.id} className="session-row" data-active={activeSession===s.id} onClick={()=>onPickSession(s.id)}>
               <span className="session-dot" />
               <div style={{minWidth:0}}>
                 <div className="session-title">{s.title}</div>
                 <div className="session-meta">
-                  <span className="session-tag" style={{color:a.color, background:a.bg}}>{a.short}</span>
-                  {' · '}{s.msgs} msgs · <span className="mono">{s.when}</span>
+                  {a.short && <span className="session-tag" style={{color:a.color, background:a.bg}}>{a.short}</span>}
+                  {a.short && ' · '}{s.msg_count || 0} msgs · <span className="mono">{relativeTime(s.updated_at)}</span>
                 </div>
               </div>
             </div>
@@ -170,10 +207,10 @@ function Rail({ activeSession, setActiveSession, activeAgent }) {
       </div>
 
       <div className="rail-footer">
-        <div className="rail-stat"><span>Routes / 24h</span><b>132</b></div>
-        <div className="rail-stat"><span>Tool calls</span><b>412</b></div>
-        <div className="rail-stat"><span>Avg latency</span><b>1.88s</b></div>
-        <div className="rail-stat"><span>Build</span><b>5.2.0</b></div>
+        <div className="rail-stat"><span>Routes</span><b>{stats?.totalCalls ?? 0}</b></div>
+        <div className="rail-stat"><span>Tool calls</span><b>{stats?.toolCalls ?? 0}</b></div>
+        <div className="rail-stat"><span>Avg latency</span><b>{stats?.avgLatencyMs ? (stats.avgLatencyMs/1000).toFixed(2)+'s' : '—'}</b></div>
+        <div className="rail-stat"><span>Build</span><b>{stats?.version || '7.x'}</b></div>
       </div>
     </aside>
   );
@@ -331,6 +368,8 @@ function App() {
   const [loading, setLoading]   = useState(false);
   const [sessionId, setSessionId] = useState(null);
   const [health, setHealth] = useState(null);
+  const [sessions, setSessions] = useState(null);    // null = not yet loaded
+  const [stats,    setStats]    = useState(null);
 
   // pick last agent message for default inspect
   useEffect(() => {
@@ -369,6 +408,21 @@ function App() {
     const id = setInterval(tick, 6000);
     return () => { alive = false; clearInterval(id); };
   }, []);
+
+  // poll /api/sessions for the rail and /api/stats for the graph + rail footer
+  const refreshLiveData = useCallback(async () => {
+    const [s, st] = await Promise.all([
+      api.listSessions(50).catch(() => ({ sessions: [] })),
+      api.getStats().catch(() => null),
+    ]);
+    setSessions(s.sessions || []);
+    if (st) setStats(st);
+  }, []);
+  useEffect(() => {
+    refreshLiveData();
+    const id = setInterval(refreshLiveData, 8000);
+    return () => clearInterval(id);
+  }, [refreshLiveData]);
 
   // sync the actual chaos state from the server on mount and when the panel opens
   useEffect(() => {
@@ -417,13 +471,18 @@ function App() {
         time: nowTime(),
         routedFrom: 'orchestrator',
         routingReason: data.routing_reason || '—',
-        latencyMs,
+        latencyMs: typeof data.latency_ms === 'number' ? Math.round(data.latency_ms) : latencyMs,
         text: data.response,
-        trace: [],
+        // Real ReAct trace (thoughts + tool calls + results) from the server.
+        // Spans tab stays empty — those are exported async to Dash0.
+        trace: Array.isArray(data.trace) ? data.trace : [],
         spans: [],
+        tokens: undefined,
       };
       setMessages(prev => [...prev, agentMsg]);
       setInspectId(agentMsg.id);
+      // After a successful turn, refresh the rail + graph data
+      refreshLiveData();
     } catch (err) {
       const errMsg = {
         id: uid('e'), role: 'agent', agent: 'incident',
@@ -437,6 +496,19 @@ function App() {
     } finally {
       setLoading(false);
     }
+  }, [sessionId, refreshLiveData]);
+
+  // Operator clicks a session in the rail — load its messages and switch to it
+  const handlePickSession = useCallback(async (sid) => {
+    if (!sid || sid === sessionId) return;
+    try {
+      const data = await api.getSessionMessages(sid);
+      setSessionId(sid);
+      setMessages(data.messages || []);
+      const lastAgent = [...(data.messages || [])].reverse().find(m => m.role === 'agent');
+      setInspectId(lastAgent?.id || null);
+      setView('chat');
+    } catch (e) { /* ignore */ }
   }, [sessionId]);
 
   const handleClearSession = useCallback(async () => {
@@ -444,7 +516,8 @@ function App() {
     setSessionId(null);
     setMessages([]);
     setInspectId(null);
-  }, [sessionId]);
+    refreshLiveData();
+  }, [sessionId, refreshLiveData]);
 
   // setMode dispatched from ChaosPanel — also pushes the mode to the server.
   const handleChaosMode = useCallback(async (mode) => {
@@ -470,8 +543,12 @@ function App() {
           onChaosToggle={()=>setChaosOpen(o=>!o)}
           onSimOpen={()=>setSimOpen(true)}/>
 
-        <Rail activeSession={activeSession} setActiveSession={setActiveSession}
-          activeAgent={inspectMsg?.agent}/>
+        <Rail
+          sessions={sessions}
+          activeSession={sessionId}
+          onPickSession={handlePickSession}
+          activeAgent={inspectMsg?.agent}
+          stats={stats}/>
 
         <main className="main">
           {view === 'chat' && (
@@ -489,7 +566,12 @@ function App() {
             <OrchestratorGraph
               activeAgent={inspectMsg?.agent}
               recentRoute={inspectMsg?.agent}
-              totals={graphTotals}/>
+              totals={stats ? {
+                byAgent:    stats.byAgent || {},
+                totalCalls: stats.totalCalls || 0,
+                toolCalls:  stats.toolCalls || 0,
+                avgLatency: stats.avgLatencyMs || 0,
+              } : graphTotals}/>
           )}
           {view === 'sla' && <SLAPane/>}
         </main>

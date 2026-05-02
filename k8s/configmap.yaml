@@ -25,7 +25,7 @@ data:
   # reachable by browser clients.
   DASH0_INGRESS_ENDPOINT: "https://ingress.europe-west4.gcp.dash0.com"
   ENVIRONMENT: "k8s"
-  APP_VERSION: "7.0.0"
+  APP_VERSION: "7.1.0"
 
   # LangSmith
   LANGCHAIN_TRACING_V2: "true"

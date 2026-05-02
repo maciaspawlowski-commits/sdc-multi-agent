@@ -53,7 +53,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-APP_VERSION = os.getenv("APP_VERSION", "7.0.0")
+APP_VERSION = os.getenv("APP_VERSION", "7.1.0")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama3.2")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -103,9 +103,126 @@ async def _delete_session(session_id: str) -> None:
     """Remove a session from Redis."""
     try:
         r = await _get_redis()
-        await r.delete(f"sdc:session:{session_id}")
+        await r.delete(f"sdc:session:{session_id}", f"sdc:session-meta:{session_id}")
     except Exception as exc:
         logger.warning("session delete failed id=%s error=%s", session_id, exc)
+
+
+async def _save_session_meta(
+    session_id: str,
+    *,
+    title: str,
+    last_agent: str,
+    routing_reason: str,
+    msg_count: int,
+    latency_ms: float,
+) -> None:
+    """Persist sidecar metadata so /api/sessions can list sessions cheaply
+    without deserialising every message blob.  Same TTL as the messages key."""
+    try:
+        r = await _get_redis()
+        payload = json.dumps({
+            "id":             session_id,
+            "title":          (title or "").strip()[:120] or "(empty)",
+            "last_agent":     last_agent,
+            "routing_reason": (routing_reason or "")[:240],
+            "msg_count":      msg_count,
+            "last_latency_ms": round(latency_ms, 1),
+            "updated_at":     time.time(),
+        })
+        await r.set(f"sdc:session-meta:{session_id}", payload, ex=SESSION_TTL)
+    except Exception as exc:
+        logger.warning("session meta save failed id=%s error=%s", session_id, exc)
+
+
+# ── Per-message trace extractor ──────────────────────────────────────────────
+# Walks the LangGraph result's `messages` list and produces a ReAct-style
+# trace shaped to match what the Operator Console's Inspector expects:
+#   [
+#     { kind: 'thought', text: '...' },
+#     { kind: 'tool',    tool: 'search_runbook', args: {...},
+#                        result: '...', ms: 312, ok: true },
+#     { kind: 'final',   text: '...' },
+#   ]
+def _extract_trace_from_messages(messages: list, max_tail: int = 12) -> list[dict]:
+    """Build a trace from the *new* messages produced by this chat invocation.
+
+    `messages` should be the tail of the conversation that was added by the
+    most recent ainvoke() — typically the AI/Tool messages after the last
+    HumanMessage.  We tolerate the full list and just emit thoughts + tool
+    calls + tool results in order.
+    """
+    trace_items: list[dict] = []
+    pending_tool_by_id: dict[str, dict] = {}
+
+    for m in messages:
+        kind = getattr(m, "type", None)
+        if kind == "ai":
+            content = (getattr(m, "content", None) or "").strip()
+            tool_calls = getattr(m, "tool_calls", None) or []
+            # An AIMessage can either reason aloud (with tool_calls) or
+            # produce the final answer.  We treat any non-empty content
+            # before tool_calls as a `thought`, and content on a leaf
+            # AIMessage (no tool_calls) as the `final` answer.
+            if content:
+                trace_items.append({
+                    "kind": "thought" if tool_calls else "final",
+                    "text": content[:1200],
+                })
+            for tc in tool_calls:
+                entry = {
+                    "kind":   "tool",
+                    "tool":   tc.get("name", "?"),
+                    "args":   tc.get("args") or {},
+                    "result": "",
+                    "ms":     None,
+                    "ok":     True,
+                    "_id":    tc.get("id", ""),
+                }
+                trace_items.append(entry)
+                if entry["_id"]:
+                    pending_tool_by_id[entry["_id"]] = entry
+        elif kind == "tool":
+            tcid = getattr(m, "tool_call_id", "") or ""
+            text = (getattr(m, "content", None) or "")[:1200]
+            entry = pending_tool_by_id.pop(tcid, None)
+            if entry is not None:
+                entry["result"] = text
+            else:
+                trace_items.append({"kind": "result", "text": text})
+        # HumanMessage and others are ignored — the trace describes the
+        # agent's reasoning, not the user's input.
+
+    # Strip helper id from outgoing payload
+    for e in trace_items:
+        e.pop("_id", None)
+    return trace_items[-max_tail * 4:]  # rough cap
+
+
+# ── Live in-process stats (per pod, since process start) ─────────────────────
+# Used by GET /api/stats to drive the Operator Console's Graph view.
+# Multi-replica deployments will see one pod's view; that's intentional —
+# fleet-wide aggregation is what Dash0 / Prometheus is for.  This endpoint
+# exists so the UI can show live, free counters without scraping a TSDB.
+_stats_lock: Optional[asyncio.Lock] = None
+_stats: dict = {
+    "started_at":  time.time(),
+    "by_agent":    {},   # agent_id -> count
+    "tool_calls":  0,
+    "total_calls": 0,
+    "total_latency_ms": 0.0,
+    "errors":      0,
+}
+
+
+def _bump_stats(*, agent: str, latency_ms: float, tool_calls: int = 0, error: bool = False) -> None:
+    if error:
+        _stats["errors"] += 1
+        return
+    _stats["by_agent"][agent] = _stats["by_agent"].get(agent, 0) + 1
+    _stats["tool_calls"] += tool_calls
+    _stats["total_calls"] += 1
+    _stats["total_latency_ms"] += latency_ms
 
 
 @asynccontextmanager
@@ -179,6 +296,10 @@ class ChatResponse(BaseModel):
     routing_reason: str
     session_id: str
     model: str
+    latency_ms: float = 0.0
+    # ReAct-style trace (thoughts + tool calls with their results) extracted
+    # from the LangGraph result.  Drives the Operator Console's Inspector.
+    trace: list = []
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -283,6 +404,7 @@ async def chat(req: ChatRequest):
             span.set_attribute("error.type", type(exc).__name__)
             _error_counter.add(1, {"sdc.agent": "unknown", "llm.model": LLM_MODEL})
             _latency_hist.record(latency_ms, {"sdc.agent": "unknown", "status": "error"})
+            _bump_stats(agent="unknown", latency_ms=latency_ms, error=True)
             logger.error("Graph invocation failed session=%s error=%s", session_id, exc)
             raise HTTPException(status_code=502, detail=f"Agent error: {exc}")
         finally:
@@ -308,12 +430,31 @@ async def chat(req: ChatRequest):
         _agent_counter.add(1, attrs)
         _latency_hist.record(latency_ms, {**attrs, "status": "ok"})
 
+        # Trace for the Operator Console's Inspector — only emit the new
+        # tail (everything after the user message we just appended) so the
+        # client doesn't get the whole conversation as a trace each turn.
+        new_tail = result["messages"][len(history):]
+        trace_items = _extract_trace_from_messages(new_tail)
+        tool_call_count = sum(1 for t in trace_items if t.get("kind") == "tool")
+
         # Persist full conversation for multi-turn
         await _save_session(session_id, list(result["messages"]))
+        # Sidecar metadata so /api/sessions can list cheaply
+        await _save_session_meta(
+            session_id,
+            title=req.message,
+            last_agent=agent,
+            routing_reason=routing_reason,
+            msg_count=len(result["messages"]),
+            latency_ms=latency_ms,
+        )
+
+        # Live counters for /api/stats (drives the Graph view)
+        _bump_stats(agent=agent, latency_ms=latency_ms, tool_calls=tool_call_count)
 
         logger.info(
-            "chat ok session=%s agent=%s model=%s latency_ms=%.0f routing=%s",
-            session_id, agent, LLM_MODEL, latency_ms, routing_reason,
+            "chat ok session=%s agent=%s model=%s latency_ms=%.0f tools=%d routing=%s",
+            session_id, agent, LLM_MODEL, latency_ms, tool_call_count, routing_reason,
         )
 
         return ChatResponse(
@@ -324,6 +465,8 @@ async def chat(req: ChatRequest):
             routing_reason=routing_reason,
             session_id=session_id,
             model=LLM_MODEL,
+            latency_ms=round(latency_ms, 1),
+            trace=trace_items,
         )
 
 
@@ -331,6 +474,149 @@ async def chat(req: ChatRequest):
 async def clear_session(session_id: str):
     await _delete_session(session_id)
     return {"cleared": session_id}
+
+
+@app.get("/api/sessions")
+async def list_sessions(limit: int = 50):
+    """List recent Redis-stored sessions, newest first.
+
+    Cheap because we read sidecar `sdc:session-meta:<id>` keys instead of
+    deserialising every full message blob.  Falls back to scanning the
+    legacy `sdc:session:<id>` keys if no metadata exists yet (older sessions
+    written before this version).
+    """
+    out: list[dict] = []
+    try:
+        r = await _get_redis()
+        # Prefer metadata keys (cheap)
+        meta_keys: list[str] = []
+        async for k in r.scan_iter(match="sdc:session-meta:*", count=200):
+            meta_keys.append(k)
+            if len(meta_keys) >= limit * 4:
+                break
+        for k in meta_keys:
+            raw = await r.get(k)
+            if not raw:
+                continue
+            try:
+                m = json.loads(raw)
+                out.append(m)
+            except Exception:
+                continue
+        # Fall back: any legacy session key without metadata
+        if not out:
+            async for k in r.scan_iter(match="sdc:session:*", count=200):
+                sid = k.split(":")[-1]
+                raw = await r.get(k)
+                if not raw:
+                    continue
+                try:
+                    msg_dicts = json.loads(raw)
+                    title = ""
+                    for md in msg_dicts:
+                        if md.get("type") == "human":
+                            title = md.get("data", {}).get("content", "")
+                            break
+                    out.append({
+                        "id":         sid,
+                        "title":      (title or "")[:120] or "(legacy session)",
+                        "last_agent": None,
+                        "msg_count":  len(msg_dicts),
+                        "updated_at": 0,
+                    })
+                except Exception:
+                    continue
+                if len(out) >= limit:
+                    break
+    except Exception as exc:
+        logger.warning("list sessions failed: %s", exc)
+        return {"sessions": [], "error": str(exc)}
+
+    out.sort(key=lambda s: s.get("updated_at", 0), reverse=True)
+    return {"sessions": out[:limit]}
+
+
+@app.get("/api/session/{session_id}/messages")
+async def get_session_messages(session_id: str):
+    """Return the full conversation for a session — used when the operator
+    clicks a session in the rail to switch contexts in the UI."""
+    try:
+        r = await _get_redis()
+        raw = await r.get(f"sdc:session:{session_id}")
+        if not raw:
+            return {"session_id": session_id, "messages": []}
+        msgs = json.loads(raw)
+        # Shape into the Console's message schema
+        out = []
+        last_user = None
+        for m in msgs:
+            kind = m.get("type")
+            content = (m.get("data") or {}).get("content", "")
+            if kind == "human":
+                out.append({
+                    "id":     f"u-{len(out)}",
+                    "role":   "user",
+                    "author": "You",
+                    "time":   "",  # no per-message timestamp persisted
+                    "text":   content,
+                })
+                last_user = content
+            elif kind == "ai":
+                # Skip empty intermediate AIMessages (those that only carry tool_calls)
+                if not content.strip():
+                    continue
+                out.append({
+                    "id":            f"a-{len(out)}",
+                    "role":          "agent",
+                    "agent":         m.get("data", {}).get("additional_kwargs", {}).get("sdc_agent") or "incident",
+                    "time":          "",
+                    "routedFrom":    "orchestrator",
+                    "routingReason": "(restored from session)",
+                    "latencyMs":     None,
+                    "text":          content,
+                    "trace":         [],
+                    "spans":         [],
+                })
+        # Try to enrich the last agent message with metadata (last_agent, latency)
+        meta_raw = await r.get(f"sdc:session-meta:{session_id}")
+        if meta_raw:
+            try:
+                meta = json.loads(meta_raw)
+                for m in reversed(out):
+                    if m["role"] == "agent":
+                        m["agent"] = meta.get("last_agent") or m["agent"]
+                        m["routingReason"] = meta.get("routing_reason") or m["routingReason"]
+                        m["latencyMs"] = meta.get("last_latency_ms")
+                        break
+            except Exception:
+                pass
+        return {"session_id": session_id, "messages": out}
+    except Exception as exc:
+        logger.warning("get_session_messages failed id=%s error=%s", session_id, exc)
+        return {"session_id": session_id, "messages": [], "error": str(exc)}
+
+
+@app.get("/api/stats")
+async def get_stats():
+    """Live, in-process counters consumed by the Operator Console's Graph view.
+
+    These are pod-local — fleet-wide aggregation lives in Dash0 / Prometheus
+    via the OTel meters.  This endpoint exists so the UI can show live counts
+    without scraping a TSDB.
+    """
+    by_agent = dict(_stats["by_agent"])
+    total = _stats["total_calls"]
+    avg_latency = (_stats["total_latency_ms"] / total) if total else 0.0
+    return {
+        "byAgent":        by_agent,
+        "totalCalls":     total,
+        "toolCalls":      _stats["tool_calls"],
+        "errors":         _stats["errors"],
+        "avgLatencyMs":   round(avg_latency, 1),
+        "uptimeSeconds":  round(time.time() - _stats["started_at"], 1),
+        "model":          LLM_MODEL,
+        "version":        APP_VERSION,
+    }
 
 
 @app.post("/api/simulate/black-friday")
