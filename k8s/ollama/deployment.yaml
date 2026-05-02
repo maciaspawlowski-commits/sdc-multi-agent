@@ -26,15 +26,16 @@ spec:
           ports:
             - containerPort: 11434
           resources:
-            # Bumped from 4 → 12 CPUs (host has 22 vCPUs).  Ollama is purely
-            # CPU-bound on minikube without GPU passthrough; the prior 4 CPU
-            # ceiling was the dominant cause of multi-second per-token latency.
+            # CPU limit kept at 4 deliberately.  LLM inference on llama.cpp
+            # is memory-bandwidth-bound, not core-bound — bumping limit to
+            # 12 CPUs measurably *slows* the 3 B model (more threads → more
+            # cache/NUMA contention).  4 is a sweet spot for Q4_K_M on AVX2.
             requests:
               memory: "6Gi"
-              cpu: "4"
+              cpu: "2"
             limits:
               memory: "8Gi"
-              cpu: "12"
+              cpu: "4"
           volumeMounts:
             - name: models
               mountPath: /root/.ollama

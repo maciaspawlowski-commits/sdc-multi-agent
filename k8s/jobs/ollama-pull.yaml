@@ -28,10 +28,10 @@ spec:
             - sh
             - -c
             - |
-              echo "Pulling llama3.2:1b model..."
+              echo "Pulling llama3.2 model (3B — required for reliable tool calling)..."
               curl -sf -X POST http://ollama:11434/api/pull \
                 -H "Content-Type: application/json" \
-                -d '{"name":"llama3.2:1b","stream":false}' \
+                -d '{"name":"llama3.2","stream":false}' \
                 --max-time 600
               echo "Pull request complete"
           resources:
