@@ -6,7 +6,7 @@ metadata:
 data:
   # LLM backend
   OLLAMA_HOST: "http://ollama:11434"
-  LLM_MODEL: "llama3.2"
+  LLM_MODEL: "llama3.2:1b"
 
   # Vector store (ChromaDB server mode)
   CHROMA_HOST: "chromadb"

@@ -26,12 +26,15 @@ spec:
           ports:
             - containerPort: 11434
           resources:
+            # Bumped from 4 → 12 CPUs (host has 22 vCPUs).  Ollama is purely
+            # CPU-bound on minikube without GPU passthrough; the prior 4 CPU
+            # ceiling was the dominant cause of multi-second per-token latency.
             requests:
               memory: "6Gi"
-              cpu: "2"
+              cpu: "4"
             limits:
               memory: "8Gi"
-              cpu: "4"
+              cpu: "12"
           volumeMounts:
             - name: models
               mountPath: /root/.ollama
