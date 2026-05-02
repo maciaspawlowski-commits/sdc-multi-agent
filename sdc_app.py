@@ -30,7 +30,8 @@ from typing import Optional
 import httpx
 import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage, messages_from_dict, messages_to_dict
 from opentelemetry import baggage, metrics, trace
 from opentelemetry.context import attach, detach
@@ -52,7 +53,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-APP_VERSION = os.getenv("APP_VERSION", "6.0.0")
+APP_VERSION = os.getenv("APP_VERSION", "7.0.0")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama3.2")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -149,6 +150,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="SDC Multi-Agent System", lifespan=lifespan)
+
+# ── Static assets ────────────────────────────────────────────────────────────
+# The Operator Console is a React SPA shipped as static files in static/console/.
+# Mounting with html=True makes /console/ serve index.html directly so the
+# relative imports inside (data.js, styles.css, *.jsx) resolve against /console/.
+_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+if os.path.isdir(os.path.join(_STATIC_DIR, "console")):
+    app.mount(
+        "/console",
+        StaticFiles(directory=os.path.join(_STATIC_DIR, "console"), html=True),
+        name="console",
+    )
 
 
 # ── Request / Response models ────────────────────────────────────────────────
@@ -1188,7 +1201,7 @@ if (!endpoint || !authToken) {
 } else {
   init({
     serviceName: 'sdc-frontend',
-    serviceVersion: '6.0.0',
+    serviceVersion: '7.0.0',
     deploymentEnvironment: window.location.hostname === 'localhost' ? 'local' : 'k8s',
     endpoint: {
       url: endpoint,

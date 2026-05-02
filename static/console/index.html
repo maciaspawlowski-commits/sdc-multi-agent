@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<title>SDC Operator Console</title>
+<meta name="viewport" content="width=1440">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script src="data.js"></script>
+<!-- Dash0 RUM — same Websites-view instrumentation served by sdc_app.py at /otel-rum.js -->
+<script type="module" src="/otel-rum.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" src="icons.jsx"></script>
+<script type="text/babel" src="chat.jsx"></script>
+<script type="text/babel" src="panels.jsx"></script>
+
+<script type="text/babel">
+const { useState, useEffect, useMemo, useRef, useCallback } = React;
+
+// ── API helpers — talk to the FastAPI backend on the same origin ──────────────
+const api = {
+  async chat(message, sessionId) {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, session_id: sessionId || null }),
+    });
+    if (!res.ok) throw new Error(`chat ${res.status}: ${await res.text()}`);
+    return res.json();
+  },
+  async clearSession(sessionId) {
+    if (!sessionId) return;
+    await fetch(`/api/session/${sessionId}`, { method: 'DELETE' });
+  },
+  async getChaos() {
+    const res = await fetch('/api/chaos');
+    if (!res.ok) return null;
+    return res.json();
+  },
+  async setChaos(mode, probability, delay_ms) {
+    if (mode === 'none') {
+      await fetch('/api/chaos', { method: 'DELETE' });
+      return { mode: 'none' };
+    }
+    const res = await fetch('/api/chaos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode, probability: probability/100, delay_ms }),
+    });
+    if (!res.ok) throw new Error(`chaos ${res.status}`);
+    return res.json();
+  },
+  async health() {
+    const res = await fetch('/health');
+    if (!res.ok) return null;
+    return res.json();
+  },
+  // Stream the Black Friday SSE response from POST /api/simulate/black-friday.
+  async streamSimulation(onEvent, signal) {
+    const res = await fetch('/api/simulate/black-friday', {
+      method: 'POST',
+      signal,
+    });
+    if (!res.ok || !res.body) throw new Error(`sim ${res.status}`);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const block = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const dataLine = block.split('\n').find(l => l.startsWith('data:'));
+        if (!dataLine) continue;
+        try { onEvent(JSON.parse(dataLine.slice(5).trim())); } catch (e) { /* ignore */ }
+      }
+    }
+  },
+};
+window.api = api;
+
+const nowTime = () => {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+};
+const uid = (p='m') => `${p}-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
+
+function TopBar({ view, setView, chaosMode, chaosOpen, onChaosToggle, onSimOpen }) {
+  return (
+    <header className="topbar">
+      <div className="brand">
+        <span className="brand-mark">S</span>
+        <div>
+          <div className="brand-name">SDC Operator Console</div>
+        </div>
+        <span className="brand-sub mono">multi-agent control plane</span>
+      </div>
+      <div className="tabs">
+        {[
+          { id: 'chat',  label: 'Chat'  },
+          { id: 'graph', label: 'Graph' },
+          { id: 'sla',   label: 'SLA'   },
+        ].map(n => (
+          <button key={n.id} className="tab" aria-current={view===n.id} onClick={()=>setView(n.id)}>
+            <span className="dot" /> {n.label}
+          </button>
+        ))}
+      </div>
+      <span className="topbar-spacer" />
+      <span className="live-pulse"><span className="pulse-dot"/> Ollama · llama3.2 · LangGraph · Dash0</span>
+      <button className="chaos-btn" data-active={chaosMode!=='none' || chaosOpen} onClick={onChaosToggle}>
+        <Icon.flame/> Chaos
+      </button>
+      <button className="icon-btn" onClick={onSimOpen} title="Run Black Friday simulation">
+        <Icon.cart/>
+      </button>
+    </header>
+  );
+}
+
+function Rail({ activeSession, setActiveSession, activeAgent }) {
+  return (
+    <aside className="rail">
+      <div className="rail-section">Specialist agents <span/></div>
+      <div className="rail-list">
+        {window.AGENTS.filter(a=>a.id!=='orchestrator').map(a => {
+          const I = Icon[a.id];
+          const active = activeAgent === a.id;
+          return (
+            <div key={a.id} className="agent-row" data-active={active} style={{['--agent-color']:a.color, ['--agent-bg']:a.bg}}>
+              <span className="agent-glyph"><I/></span>
+              <div>
+                <div className="agent-name">{a.name}</div>
+                <div className="agent-meta">{a.desc}</div>
+              </div>
+              <span className="agent-pill">{active ? 'active' : `${window.AGENT_TOOL_COUNTS[a.id]||0}t`}</span>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="rail-section">Sessions <span style={{fontFamily:"'JetBrains Mono', monospace", color:'var(--fg-3)'}}>{window.SESSIONS.length}</span></div>
+      <div className="sessions-list">
+        {window.SESSIONS.map(s => {
+          const a = window.AGENTS.find(x=>x.id===s.agent) || {};
+          return (
+            <div key={s.id} className="session-row" data-active={activeSession===s.id} onClick={()=>setActiveSession(s.id)}>
+              <span className="session-dot" />
+              <div style={{minWidth:0}}>
+                <div className="session-title">{s.title}</div>
+                <div className="session-meta">
+                  <span className="session-tag" style={{color:a.color, background:a.bg}}>{a.short}</span>
+                  {' · '}{s.msgs} msgs · <span className="mono">{s.when}</span>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="rail-footer">
+        <div className="rail-stat"><span>Routes / 24h</span><b>132</b></div>
+        <div className="rail-stat"><span>Tool calls</span><b>412</b></div>
+        <div className="rail-stat"><span>Avg latency</span><b>1.88s</b></div>
+        <div className="rail-stat"><span>Build</span><b>5.2.0</b></div>
+      </div>
+    </aside>
+  );
+}
+
+function ChatView({
+  messages, inspectId, setInspectId, streamingId, streamProgress,
+  composer, setComposer, loading, onSend, onClearSession, sessionId,
+}) {
+  const scrollRef = useRef(null);
+  const taRef = useRef(null);
+
+  // auto-scroll to bottom on new message / loading state
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [messages.length, loading]);
+
+  // auto-grow textarea
+  useEffect(() => {
+    if (!taRef.current) return;
+    taRef.current.style.height = 'auto';
+    taRef.current.style.height = Math.min(160, taRef.current.scrollHeight) + 'px';
+  }, [composer]);
+
+  const send = () => {
+    const text = composer.trim();
+    if (!text || loading) return;
+    onSend(text);
+  };
+
+  const onKey = (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); send(); }
+  };
+
+  // collect distinct agents seen so far for the header chips
+  const agentsInSession = Array.from(new Set(messages.filter(m=>m.role==='agent').map(m=>m.agent)));
+  const startedAt = messages[0]?.time || nowTime();
+
+  return (
+    <div className="chat-wrap">
+      <div className="pane-header">
+        <div>
+          <div className="pane-title">Live operator session</div>
+          <div className="pane-sub mono">
+            {sessionId ? `${sessionId.slice(0,18)}…` : 'no session yet'} · started {startedAt} · {messages.length} messages · {agentsInSession.length} specialists
+          </div>
+        </div>
+        <div className="pane-actions">
+          {agentsInSession.map(id => {
+            const a = window.AGENTS.find(x=>x.id===id) || {};
+            return <span key={id} className="pane-chip" style={{color:a.color, borderColor:a.color, background:a.bg}}>{a.short || id}</span>;
+          })}
+          <span className="pane-chip live">● live</span>
+          {sessionId && (
+            <button className="pane-chip" style={{cursor:'pointer'}} onClick={onClearSession} title="Clear server-side session and start fresh">
+              ↺ reset
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="chat-scroll" ref={scrollRef}>
+        <div className="chat-stack">
+          {messages.map(m => m.role === 'user'
+            ? <UserMessage key={m.id} msg={m}/>
+            : <AgentMessage key={m.id} msg={m}
+                onInspect={setInspectId}
+                isInspected={inspectId===m.id}
+                isStreaming={streamingId===m.id}
+                streamProgress={streamingId===m.id?streamProgress:1}/>)}
+          {loading && (
+            <div className="msg agent-msg" style={{['--agent-color']:'var(--orch)', ['--agent-bg']:'var(--orch-bg)'}}>
+              <div className="agent-card" style={{padding:'14px 18px'}}>
+                <div className="agent-card-route mono" style={{display:'flex',alignItems:'center',gap:10}}>
+                  <span className="streaming-caret" /> orchestrator → routing… <span className="kbd" style={{marginLeft:8}}>llama3.2</span>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="composer">
+        <div className="composer-inner">
+          <div className="composer-box">
+            <textarea ref={taRef} className="composer-input" rows="1"
+              value={composer}
+              onChange={e=>setComposer(e.target.value)}
+              onKeyDown={onKey}
+              disabled={loading}
+              placeholder="Describe an incident, request a change, ask about an SLA…"/>
+            <div className="composer-tools">
+              <button className="icon-btn" title="Attach (not implemented)"><Icon.attach/></button>
+              <button className="send-btn" onClick={send} disabled={loading || !composer.trim()}>
+                <Icon.send/> {loading ? 'Sending…' : 'Send'} <span className="kbd">⌘↵</span>
+              </button>
+            </div>
+          </div>
+          <div className="suggest-row">
+            {window.SUGGESTIONS.map(s => {
+              const a = window.AGENTS.find(x=>x.id===s.agent);
+              return (
+                <button key={s.label} className="suggest-chip" disabled={loading}
+                  onClick={()=>setComposer(s.prompt || s.label)}>
+                  <span className="agent-dot" style={{background:a.color}} />
+                  {s.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StatusBar({ chaosMode, health, sessionId, messageCount }) {
+  const D = window.STATUS_DATA;
+  const ok = !!health;
+  const model = health?.model || D.ollama;
+  const agentCount = health?.agents?.length || 5;
+  const kbDocs = health?.knowledge_base
+    ? Object.values(health.knowledge_base).reduce((a, x) => a + (x?.runbooks||0) + (x?.records||0), 0)
+    : 0;
+  return (
+    <div className="status-bar">
+      <span className="sb"><span className="ico" style={{background: ok ? 'var(--ok)' : 'var(--danger)'}} /> Ollama <b>{model}</b></span>
+      <span className="sb"><span className="ico" style={{background:'var(--orch)'}} /> LangGraph <b>{agentCount} agents</b></span>
+      <span className="sb">OTel <b>{D.observability}</b></span>
+      <span className="sb">session <b>{sessionId ? sessionId.slice(0,8)+'…' : '—'}</b></span>
+      <span className="sb-spacer" />
+      <span className="sb">msgs <b>{messageCount}</b></span>
+      <span className="sb">kb-docs <b>{kbDocs}</b></span>
+      <span className="sb">redis <b>{ok ? 'OK' : '?'}</b></span>
+      <span className="sb">chaos <b style={{color: chaosMode==='none' ? 'var(--ok)' : 'var(--danger)'}}>{chaosMode}</b></span>
+      <span className="sb">{D.build}</span>
+    </div>
+  );
+}
+
+function App() {
+  const [view, setView] = useState('chat');
+  const [activeSession, setActiveSession] = useState('sess-payment-p1');
+  const [inspectId, setInspectId] = useState(null);
+  const [simOpen, setSimOpen] = useState(false);
+  const [chaosOpen, setChaosOpen] = useState(false);
+  const [chaosMode, setChaosMode] = useState('none');
+  const [streamingId, setStreamingId] = useState(null);
+  const [streamProgress, setStreamProgress] = useState(0);
+  const [chaosEvents, setChaosEvents] = useState([]);
+
+  // ── real, live state ────────────────────────────────────────────────────────
+  const [messages, setMessages] = useState(() => window.ACTIVE_CONVERSATION || []);
+  const [composer, setComposer] = useState('');
+  const [loading, setLoading]   = useState(false);
+  const [sessionId, setSessionId] = useState(null);
+  const [health, setHealth] = useState(null);
+
+  // pick last agent message for default inspect
+  useEffect(() => {
+    const last = [...messages].reverse().find(m => m.role==='agent');
+    if (last) setInspectId(last.id);
+  }, []); // run once on mount
+
+  // streaming-reveal animation runs once per new agent message that hasn't been animated
+  const animatedIds = useRef(new Set());
+  useEffect(() => {
+    const last = messages[messages.length - 1];
+    if (!last || last.role !== 'agent' || animatedIds.current.has(last.id)) return;
+    animatedIds.current.add(last.id);
+    setStreamingId(last.id);
+    setStreamProgress(0);
+    let raf, start = performance.now();
+    const dur = Math.min(2400, (last.text || '').length * 6);
+    const tick = (now) => {
+      const t = Math.min(1, (now - start) / dur);
+      setStreamProgress(t);
+      if (t < 1) raf = requestAnimationFrame(tick);
+      else setStreamingId(null);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [messages]);
+
+  // poll /health for the status bar (ollama, agents, kb counts)
+  useEffect(() => {
+    let alive = true;
+    const tick = async () => {
+      const h = await api.health().catch(() => null);
+      if (alive) setHealth(h);
+    };
+    tick();
+    const id = setInterval(tick, 6000);
+    return () => { alive = false; clearInterval(id); };
+  }, []);
+
+  // sync the actual chaos state from the server on mount and when the panel opens
+  useEffect(() => {
+    api.getChaos().then(s => {
+      if (s && typeof s.mode === 'string') setChaosMode(s.mode);
+    }).catch(()=>{});
+  }, [chaosOpen]);
+
+  // chaos cosmetic events (visual flair) — only while a real mode is active
+  useEffect(() => {
+    if (chaosMode === 'none') { setChaosEvents([]); return; }
+    const id = setInterval(() => {
+      const map = {
+        llm_slow:    { kind: 'llm.slow',    msg: '+3142ms injected on llama3.2 chat' },
+        llm_error:   { kind: 'llm.error',   msg: 'ConnectionError on tool_call response' },
+        tool_error:  { kind: 'tool.error',  msg: 'classify_priority returned 503 (chaos)' },
+        rag_degraded:{ kind: 'rag.empty',   msg: 'search_runbook(k=4) → 0 results' },
+      };
+      const e = map[chaosMode];
+      if (!e) return;
+      setChaosEvents(prev => [{ t: nowTime(), ...e }, ...prev].slice(0, 12));
+    }, 3500);
+    return () => clearInterval(id);
+  }, [chaosMode]);
+
+  const inspectMsg = useMemo(
+    () => messages.find(m => m.id === inspectId),
+    [inspectId, messages]
+  );
+
+  // ── send a message to /api/chat ────────────────────────────────────────────
+  const handleSend = useCallback(async (text) => {
+    const userMsg = { id: uid('u'), role: 'user', author: 'You', time: nowTime(), text };
+    setMessages(prev => [...prev, userMsg]);
+    setComposer('');
+    setLoading(true);
+    const t0 = performance.now();
+    try {
+      const data = await api.chat(text, sessionId);
+      const latencyMs = Math.round(performance.now() - t0);
+      if (!sessionId && data.session_id) setSessionId(data.session_id);
+      const agentMsg = {
+        id: uid('a'),
+        role: 'agent',
+        agent: data.agent,
+        time: nowTime(),
+        routedFrom: 'orchestrator',
+        routingReason: data.routing_reason || '—',
+        latencyMs,
+        text: data.response,
+        trace: [],
+        spans: [],
+      };
+      setMessages(prev => [...prev, agentMsg]);
+      setInspectId(agentMsg.id);
+    } catch (err) {
+      const errMsg = {
+        id: uid('e'), role: 'agent', agent: 'incident',
+        time: nowTime(), routedFrom: 'orchestrator',
+        routingReason: 'request failed',
+        latencyMs: Math.round(performance.now() - t0),
+        text: `**Error**\n\nCould not reach the agent backend: \`${err.message}\``,
+        trace: [], spans: [],
+      };
+      setMessages(prev => [...prev, errMsg]);
+    } finally {
+      setLoading(false);
+    }
+  }, [sessionId]);
+
+  const handleClearSession = useCallback(async () => {
+    if (sessionId) await api.clearSession(sessionId).catch(()=>{});
+    setSessionId(null);
+    setMessages([]);
+    setInspectId(null);
+  }, [sessionId]);
+
+  // setMode dispatched from ChaosPanel — also pushes the mode to the server.
+  const handleChaosMode = useCallback(async (mode) => {
+    setChaosMode(mode);
+    try { await api.setChaos(mode, 50, 3000); } catch (e) { /* keep UI optimistic */ }
+  }, []);
+
+  const graphTotals = useMemo(() => {
+    const byAgent = { incident: 47, change: 23, problem: 12, service: 31, sla: 19 };
+    return {
+      byAgent,
+      totalCalls: Object.values(byAgent).reduce((a,b)=>a+b,0),
+      toolCalls: 412,
+      avgLatency: 1880,
+    };
+  }, []);
+
+  return (
+    <>
+      <div className="shell" data-inspector={view==='chat' ? 'visible' : 'hidden'}>
+        <TopBar view={view} setView={setView}
+          chaosMode={chaosMode} chaosOpen={chaosOpen}
+          onChaosToggle={()=>setChaosOpen(o=>!o)}
+          onSimOpen={()=>setSimOpen(true)}/>
+
+        <Rail activeSession={activeSession} setActiveSession={setActiveSession}
+          activeAgent={inspectMsg?.agent}/>
+
+        <main className="main">
+          {view === 'chat' && (
+            <ChatView
+              messages={messages}
+              inspectId={inspectId} setInspectId={setInspectId}
+              streamingId={streamingId} streamProgress={streamProgress}
+              composer={composer} setComposer={setComposer}
+              loading={loading}
+              onSend={handleSend}
+              onClearSession={handleClearSession}
+              sessionId={sessionId}/>
+          )}
+          {view === 'graph' && (
+            <OrchestratorGraph
+              activeAgent={inspectMsg?.agent}
+              recentRoute={inspectMsg?.agent}
+              totals={graphTotals}/>
+          )}
+          {view === 'sla' && <SLAPane/>}
+        </main>
+
+        <aside className="inspector">
+          <Inspector message={inspectMsg}/>
+        </aside>
+
+        <StatusBar chaosMode={chaosMode} health={health}
+          sessionId={sessionId} messageCount={messages.length}/>
+      </div>
+
+      <ChaosPanel open={chaosOpen} mode={chaosMode} setMode={handleChaosMode}
+        onClose={()=>setChaosOpen(false)} events={chaosEvents}/>
+
+      <SimDrawer open={simOpen} onClose={()=>setSimOpen(false)}/>
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>

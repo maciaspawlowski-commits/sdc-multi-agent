@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -c "from chromadb.utils.embedding_functions import DefaultEmbeddingFunction; DefaultEmbeddingFunction()"
 
 COPY sdc/ ./sdc/
+COPY static/ ./static/
 COPY sdc_app.py sdc_otel.py ./
 
 EXPOSE 8000
