@@ -137,8 +137,8 @@ function TopBar({ view, setView, chaosMode, chaosOpen, onChaosToggle, onSimOpen 
       <button className="chaos-btn" data-active={chaosMode!=='none' || chaosOpen} onClick={onChaosToggle}>
         <Icon.flame/> Chaos
       </button>
-      <button className="icon-btn" onClick={onSimOpen} title="Run Black Friday simulation">
-        <Icon.cart/>
+      <button className="chaos-btn" onClick={onSimOpen} title="Run a 10-step Black Friday scenario through every specialist">
+        <Icon.cart/> Black Friday
       </button>
     </header>
   );
