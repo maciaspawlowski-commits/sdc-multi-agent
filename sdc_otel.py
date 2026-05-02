@@ -63,7 +63,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExport
 logger = logging.getLogger(__name__)
 
 
-def setup_sdc_telemetry(app=None, service_version: str = "5.0.0") -> None:
+def setup_sdc_telemetry(app=None, service_version: str = "6.0.0") -> None:
     """Configure OTel providers and attach all instrumentors for the SDC app."""
 
     endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "").rstrip("/")

@@ -1,0 +1,6 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "sdc_graph": "sdc.graph:sdc_graph"
+  }
+}

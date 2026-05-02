@@ -1,3 +1,11 @@
 .env
+.env.*
+!.env.example
 __pycache__/
 *.pyc
+
+# Local-only LangGraph dev runtime state
+.langgraph_api/
+
+# Claude Code / Cursor / IDE workspace state
+.claude/

@@ -27,9 +27,10 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import httpx
 import redis.asyncio as aioredis
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response, StreamingResponse
 from langchain_core.messages import HumanMessage, messages_from_dict, messages_to_dict
 from opentelemetry import baggage, metrics, trace
 from opentelemetry.context import attach, detach
@@ -51,7 +52,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-APP_VERSION = os.getenv("APP_VERSION", "5.0.0")
+APP_VERSION = os.getenv("APP_VERSION", "6.0.0")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama3.2")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -184,6 +185,24 @@ def health():
         "knowledge_base": collection_stats(),
         "chaos": chaos_module.get_state(),
     }
+
+
+@app.get("/otel-rum.js", response_class=PlainTextResponse, include_in_schema=False)
+def otel_rum_js():
+    """Serve the Dash0 Web SDK init script with endpoint/token injected server-side.
+
+    The browser sends telemetry directly to Dash0 (CORS is supported for ingesting
+    tokens).  Injecting via this endpoint keeps the values out of source control
+    while still making them available to the browser module at runtime.
+    """
+    # OTEL_EXPORTER_OTLP_ENDPOINT is overwritten inside the pod by the Dash0
+    # operator's local collector DaemonSet — use DASH0_INGRESS_ENDPOINT for the
+    # public HTTPS URL that browser clients can actually reach.
+    endpoint  = os.getenv("DASH0_INGRESS_ENDPOINT") or os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+    endpoint  = endpoint.rstrip("/")
+    auth_token = os.getenv("DASH0_AUTH_TOKEN", "")
+    script = _RUM_SCRIPT.replace("__DASH0_ENDPOINT__", endpoint).replace("__DASH0_AUTH_TOKEN__", auth_token)
+    return PlainTextResponse(content=script, media_type="application/javascript")
 
 
 # ── Chaos endpoints ──────────────────────────────────────────────────────────
@@ -441,6 +460,7 @@ def _build_html() -> str:
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SDC Multi-Agent System</title>
+<script type="module" src="/otel-rum.js"></script>
 <style>
 * {{ box-sizing: border-box; margin: 0; padding: 0; }}
 :root {{
@@ -1146,3 +1166,38 @@ document.addEventListener('DOMContentLoaded', () => {{
 </script>
 </body>
 </html>"""
+
+
+# ── Browser RUM script (served dynamically at /otel-rum.js) ─────────────────
+# Uses the official Dash0 Web SDK (@dash0/sdk-web) which produces the session,
+# page-view, Core Web Vital, and network-request signals consumed by the
+# Dash0 "Websites" view.  The SDK sends directly to the Dash0 OTLP ingress
+# (CORS is supported for browser ingesting tokens).
+#
+# __DASH0_ENDPOINT__ and __DASH0_AUTH_TOKEN__ are replaced at request time by
+# the /otel-rum.js endpoint handler above, so no secrets live in source code.
+_RUM_SCRIPT = """\
+// Dash0 Web SDK — loaded as ES module, values injected server-side
+import { init } from 'https://esm.sh/@dash0/sdk-web';
+
+const endpoint  = '__DASH0_ENDPOINT__';
+const authToken = '__DASH0_AUTH_TOKEN__';
+
+if (!endpoint || !authToken) {
+  console.warn('[RUM] OTEL_EXPORTER_OTLP_ENDPOINT or DASH0_AUTH_TOKEN not set — RUM disabled');
+} else {
+  init({
+    serviceName: 'sdc-frontend',
+    serviceVersion: '6.0.0',
+    deploymentEnvironment: window.location.hostname === 'localhost' ? 'local' : 'k8s',
+    endpoint: {
+      url: endpoint,
+      authToken: authToken,
+    },
+    // Session config — align with backend SESSION_TTL_SECONDS (86400 s = 24 h)
+    sessionInactivityTimeoutMillis:  30 * 60 * 1000,   // 30 min idle → new session
+    sessionTerminationTimeoutMillis: 24 * 60 * 60 * 1000, // hard cap 24 h
+  });
+  console.debug('[RUM] Dash0 Web SDK initialised → ' + endpoint);
+}
+"""

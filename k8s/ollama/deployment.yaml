@@ -17,7 +17,12 @@ spec:
     spec:
       containers:
         - name: ollama
-          image: ollama/ollama:latest
+          # Use a local-only tag so Kubernetes never tries Docker Hub.
+          # The tag `cached-local` is created inside the minikube docker daemon
+          # via `docker tag ollama/ollama:latest ollama/ollama:cached-local`.
+          # imagePullPolicy: Never guarantees the kubelet uses the cached image.
+          image: ollama/ollama:cached-local
+          imagePullPolicy: Never
           ports:
             - containerPort: 11434
           resources:

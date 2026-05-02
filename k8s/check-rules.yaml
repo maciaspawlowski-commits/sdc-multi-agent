@@ -1,0 +1,106 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: sdc-agents-check-rules
+  namespace: sdc
+  labels:
+    app: sdc-agents
+spec:
+  groups:
+    # ──────────────────────────────────────────────────────────────────────────
+    # GenAI / LLM alerting rules for the sdc-agents service.
+    # These are synced by the Dash0 Kubernetes Operator to Dash0's check rules.
+    #
+    # NOTE: "recording rules" (record:) are not supported by Dash0 — only alert:
+    # rules are synced. Use dashboards for ad-hoc metric computation.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: sdc-agents.gen_ai.alerts
+      rules:
+
+        # Fire when any agent has a non-zero LLM error rate for 2 consecutive minutes
+        - alert: GenAIHighErrorRate
+          expr: |
+            sum by (sdc_agent, gen_ai_request_model) (
+              rate(gen_ai_client_requests_total{status="error"}[5m])
+            ) > 0
+          for: 2m
+          labels:
+            severity: warning
+            service: sdc-agents
+          annotations:
+            summary: "LLM errors on agent {{ $labels.sdc_agent }}"
+            description: >
+              Agent {{ $labels.sdc_agent }} (model {{ $labels.gen_ai_request_model }})
+              is returning LLM errors. Rate: {{ $value | printf "%.4f" }} req/s.
+
+        # Fire when P99 LLM latency exceeds 5 minutes (llama3.2 on CPU threshold)
+        - alert: GenAIHighLatency
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le, sdc_agent, gen_ai_request_model) (
+                rate(gen_ai_client_operation_duration_seconds_bucket[5m])
+              )
+            ) > 300
+          for: 5m
+          labels:
+            severity: warning
+            service: sdc-agents
+          annotations:
+            summary: "LLM P99 latency > 5 min on agent {{ $labels.sdc_agent }}"
+            description: >
+              Agent {{ $labels.sdc_agent }} P99 latency is {{ $value | printf "%.0f" }}s,
+              which exceeds the 5-minute threshold for llama3.2 on CPU.
+
+        # Fire when the error ratio exceeds 20% over 5 minutes
+        - alert: GenAIErrorRatioHigh
+          expr: |
+            sum by (sdc_agent) (rate(gen_ai_client_requests_total{status="error"}[5m]))
+              /
+            clamp_min(sum by (sdc_agent) (rate(gen_ai_client_requests_total[5m])), 1e-9)
+            > 0.20
+          for: 5m
+          labels:
+            severity: critical
+            service: sdc-agents
+          annotations:
+            summary: "LLM error ratio > 20% on agent {{ $labels.sdc_agent }}"
+            description: >
+              Agent {{ $labels.sdc_agent }} has {{ $value | humanizePercentage }} LLM
+              error ratio over the last 5 minutes.
+
+    - name: sdc-agents.tools.alerts
+      rules:
+
+        # Fire when any tool has a non-zero error rate
+        - alert: ToolHighErrorRate
+          expr: |
+            sum by (sdc_agent, tool_name, tool_type) (
+              rate(sdc_tool_calls_total{status="error"}[5m])
+            ) > 0
+          for: 2m
+          labels:
+            severity: warning
+            service: sdc-agents
+          annotations:
+            summary: "Tool errors: {{ $labels.tool_name }} on agent {{ $labels.sdc_agent }}"
+            description: >
+              Tool {{ $labels.tool_name }} ({{ $labels.tool_type }}) on agent
+              {{ $labels.sdc_agent }} is returning errors.
+
+        # Fire when RAG tool P99 latency exceeds 10 seconds
+        - alert: RAGToolHighLatency
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le, sdc_agent, tool_type) (
+                rate(sdc_tool_duration_ms_bucket{tool_type="rag"}[5m])
+              )
+            ) > 10000
+          for: 5m
+          labels:
+            severity: warning
+            service: sdc-agents
+          annotations:
+            summary: "RAG tool P99 latency > 10s on agent {{ $labels.sdc_agent }}"
+            description: >
+              RAG tools on agent {{ $labels.sdc_agent }} have P99 latency of
+              {{ $value | printf "%.0f" }}ms, indicating ChromaDB slowness.

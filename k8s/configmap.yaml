@@ -19,8 +19,13 @@ data:
   # OpenTelemetry
   OTEL_SERVICE_NAME: "sdc-agents"
   OTEL_EXPORTER_OTLP_ENDPOINT: "https://ingress.europe-west4.gcp.dash0.com"
+  # Public Dash0 HTTPS ingress — used by the browser RUM SDK (@dash0/sdk-web).
+  # OTEL_EXPORTER_OTLP_ENDPOINT is overwritten inside the pod by the Dash0
+  # operator's collector DaemonSet; this var keeps the original public URL
+  # reachable by browser clients.
+  DASH0_INGRESS_ENDPOINT: "https://ingress.europe-west4.gcp.dash0.com"
   ENVIRONMENT: "k8s"
-  APP_VERSION: "5.0.0"
+  APP_VERSION: "6.0.0"
 
   # LangSmith
   LANGCHAIN_TRACING_V2: "true"

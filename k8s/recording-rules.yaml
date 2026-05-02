@@ -1,0 +1,128 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: sdc-agents-recording-rules
+  namespace: sdc
+  labels:
+    app: sdc-agents
+spec:
+  groups:
+    # ──────────────────────────────────────────────────────────────────────────
+    # GenAI / LLM metrics  (gen_ai.* semantic conventions)
+    # Raw metrics emitted by SDCOTelCallback in sdc_otel.py:
+    #   gen_ai_client_operation_duration_seconds  (histogram, unit=s)
+    #   gen_ai_client_token_usage                 (histogram, unit={token})
+    #   gen_ai_client_requests_total              (counter)
+    #
+    # Attribute → Prometheus label mapping:
+    #   gen_ai.system          → gen_ai_system
+    #   gen_ai.request.model   → gen_ai_request_model
+    #   gen_ai.operation.name  → gen_ai_operation_name
+    #   gen_ai.token.type      → gen_ai_token_type  (input | output)
+    #   sdc.agent              → sdc_agent
+    #   status                 → status             (ok | error)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: sdc-agents.gen_ai.rules
+      interval: 60s
+      rules:
+
+        # LLM request throughput per agent — primary traffic indicator
+        - record: service:gen_ai_requests:rate5m
+          expr: |
+            sum by (sdc_agent, gen_ai_request_model, gen_ai_system) (
+              rate(gen_ai_client_requests_total[5m])
+            )
+
+        # LLM error rate per agent — alerted on if > 0 for 2+ intervals
+        - record: service:gen_ai_errors:rate5m
+          expr: |
+            sum by (sdc_agent, gen_ai_request_model, gen_ai_system) (
+              rate(gen_ai_client_requests_total{status="error"}[5m])
+            )
+
+        # LLM error ratio per agent — for error-ratio dashboards / SLOs
+        - record: service:gen_ai_error_ratio:rate5m
+          expr: |
+            service:gen_ai_errors:rate5m
+              /
+            clamp_min(service:gen_ai_requests:rate5m, 1e-9)
+
+        # LLM P99 latency per agent — pre-computed for cheap dashboards
+        - record: service:gen_ai_duration_p99:5m
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le, sdc_agent, gen_ai_request_model) (
+                rate(gen_ai_client_operation_duration_seconds_bucket[5m])
+              )
+            )
+
+        # LLM P50 latency per agent
+        - record: service:gen_ai_duration_p50:5m
+          expr: |
+            histogram_quantile(0.50,
+              sum by (le, sdc_agent, gen_ai_request_model) (
+                rate(gen_ai_client_operation_duration_seconds_bucket[5m])
+              )
+            )
+
+        # Token throughput — split by input/output for cost tracking
+        - record: service:gen_ai_token_usage:rate5m
+          expr: |
+            sum by (gen_ai_token_type, sdc_agent, gen_ai_request_model) (
+              rate(gen_ai_client_token_usage_sum[5m])
+            )
+
+        # Total tokens (input + output combined) — single-number cost signal
+        - record: service:gen_ai_tokens_total:rate5m
+          expr: |
+            sum by (sdc_agent, gen_ai_request_model) (
+              rate(gen_ai_client_token_usage_sum[5m])
+            )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Tool execution metrics  (sdc.tool.* custom metrics)
+    # Raw metrics emitted by SDCToolsCallback in sdc_otel.py:
+    #   sdc_tool_calls_total    (counter)
+    #   sdc_tool_duration_ms    (histogram, unit=ms)
+    #
+    # Attribute → Prometheus label mapping:
+    #   tool.name   → tool_name
+    #   sdc.agent   → sdc_agent
+    #   tool.type   → tool_type   (rag | domain)
+    #   status      → status      (ok | error)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: sdc-agents.tools.rules
+      interval: 60s
+      rules:
+
+        # Tool call throughput per agent and type (RAG vs domain)
+        - record: service:sdc_tool_calls:rate5m
+          expr: |
+            sum by (sdc_agent, tool_type, status) (
+              rate(sdc_tool_calls_total[5m])
+            )
+
+        # Tool error rate per agent
+        - record: service:sdc_tool_errors:rate5m
+          expr: |
+            sum by (sdc_agent, tool_type) (
+              rate(sdc_tool_calls_total{status="error"}[5m])
+            )
+
+        # Tool P99 latency per agent and type
+        - record: service:sdc_tool_duration_p99:5m
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le, sdc_agent, tool_type) (
+                rate(sdc_tool_duration_ms_bucket[5m])
+              )
+            )
+
+        # Tool P50 latency per agent and type
+        - record: service:sdc_tool_duration_p50:5m
+          expr: |
+            histogram_quantile(0.50,
+              sum by (le, sdc_agent, tool_type) (
+                rate(sdc_tool_duration_ms_bucket[5m])
+              )
+            )
