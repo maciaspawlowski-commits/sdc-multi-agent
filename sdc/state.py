@@ -26,3 +26,5 @@ class SDCState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     current_agent: Optional[str]   # "incident"|"change"|"problem"|"service"|"sla"|"general"
     routing_reason: Optional[str]  # why this agent was selected
+    hitl_enabled: Optional[bool]   # if True, the agent's HITL node will pause for operator approval
+    hitl_decision: Optional[str]   # filled in by the HITL node after resume — "approved" / "rejected"

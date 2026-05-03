@@ -27,13 +27,22 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
 
 // ── API helpers — talk to the FastAPI backend on the same origin ──────────────
 const api = {
-  async chat(message, sessionId) {
+  async chat(message, sessionId, hitl = false) {
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, session_id: sessionId || null }),
+      body: JSON.stringify({ message, session_id: sessionId || null, hitl: !!hitl }),
     });
     if (!res.ok) throw new Error(`chat ${res.status}: ${await res.text()}`);
+    return res.json();
+  },
+  async resume(sessionId, value) {
+    const res = await fetch('/api/chat/resume', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, value: String(value) }),
+    });
+    if (!res.ok) throw new Error(`resume ${res.status}: ${await res.text()}`);
     return res.json();
   },
   async clearSession(sessionId) {
@@ -111,7 +120,7 @@ const nowTime = () => {
 };
 const uid = (p='m') => `${p}-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
 
-function TopBar({ view, setView, chaosMode, chaosOpen, onChaosToggle, onSimOpen }) {
+function TopBar({ view, setView, chaosMode, chaosOpen, onChaosToggle, onSimOpen, hitl, onHitlToggle }) {
   return (
     <header className="topbar">
       <div className="brand">
@@ -134,6 +143,10 @@ function TopBar({ view, setView, chaosMode, chaosOpen, onChaosToggle, onSimOpen 
       </div>
       <span className="topbar-spacer" />
       <span className="live-pulse"><span className="pulse-dot"/> Ollama · llama3.2 · LangGraph · Dash0</span>
+      <button className="chaos-btn" data-active={!!hitl} onClick={onHitlToggle}
+        title="Human-in-the-loop: each specialist agent pauses for operator approval before its final answer">
+        <Icon.check/> HITL {hitl ? 'on' : 'off'}
+      </button>
       <button className="chaos-btn" data-active={chaosMode!=='none' || chaosOpen} onClick={onChaosToggle}>
         <Icon.flame/> Chaos
       </button>
@@ -216,9 +229,71 @@ function Rail({ sessions, activeSession, onPickSession, activeAgent, stats }) {
   );
 }
 
+// Inline approval card rendered in the chat stack when the graph is paused at
+// a HITL checkpoint.  Uses the same per-agent colour the agent badges use.
+function HitlCard({ pending, onResume, busy }) {
+  const a = (window.AGENTS || []).find(x => x.id === pending.agent) || {};
+  const opts = pending.options || ['approve', 'reject'];
+  const runbooks = pending.runbooks || [];
+  return (
+    <div className="msg agent-msg" style={{['--agent-color']: a.color || 'var(--signal)', ['--agent-bg']: a.bg || 'var(--signal-glow)'}}>
+      <div className="agent-card" style={{borderLeftWidth:3, borderLeftStyle:'solid', borderLeftColor:'var(--agent-color)'}}>
+        <div className="agent-card-head">
+          <span className="agent-card-glyph" style={{color:'var(--signal)'}}>
+            {(() => { const I = (window.Icon || {}).check; return I ? <I/> : null; })()}
+          </span>
+          <div>
+            <div className="agent-card-name">{pending.title || 'Operator approval required'}</div>
+            <div className="agent-card-route mono">human-in-the-loop · {pending.agent} agent</div>
+          </div>
+          <div className="agent-card-meta-right">
+            <span className="pane-chip live" style={{margin:0}}>● paused</span>
+          </div>
+        </div>
+        <div className="agent-card-body">
+          <div style={{color:'var(--fg-1)', marginBottom:10}}>{pending.prompt}</div>
+          {pending.proposal_excerpt && (
+            <blockquote style={{borderLeft:'2px solid var(--agent-color)', padding:'4px 10px', color:'var(--fg-2)', fontStyle:'italic', margin:'6px 0 12px', background:'var(--bg-1)', borderRadius:4, fontSize:12, maxHeight:160, overflow:'auto'}}>
+              {pending.proposal_excerpt}
+            </blockquote>
+          )}
+          {runbooks.length > 0 && (
+            <div style={{marginBottom:10}}>
+              <div style={{fontSize:11, color:'var(--fg-3)', letterSpacing:'.06em', marginBottom:6}}>RUNBOOK CHOICES</div>
+              <div style={{display:'flex', flexWrap:'wrap', gap:6}}>
+                {runbooks.map(rb => (
+                  <button key={rb} className="suggest-chip" disabled={busy} onClick={()=>onResume(rb)}>{rb}</button>
+                ))}
+              </div>
+            </div>
+          )}
+          <div style={{display:'flex', gap:8, flexWrap:'wrap'}}>
+            {opts.map(o => {
+              const isApprove = /^(approve|approve(d)?)$/i.test(o);
+              const isReject  = /^(reject|deny|cancel)$/i.test(o);
+              const cls = isApprove ? 'send-btn' : 'suggest-chip';
+              return (
+                <button key={o} className={cls} disabled={busy}
+                  style={isReject ? {background:'var(--danger-bg, var(--bg-2))', color:'var(--danger)', borderColor:'var(--danger)'} : undefined}
+                  onClick={()=>onResume(o)}>
+                  {o}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        <div className="agent-card-foot">
+          <span>operator decision pending — graph paused at langgraph interrupt()</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ChatView({
   messages, inspectId, setInspectId, streamingId, streamProgress,
   composer, setComposer, loading, onSend, onClearSession, sessionId,
+  pendingHitl, onResume, hitlBusy,
 }) {
   const scrollRef = useRef(null);
   const taRef = useRef(null);
@@ -281,6 +356,9 @@ function ChatView({
                 isInspected={inspectId===m.id}
                 isStreaming={streamingId===m.id}
                 streamProgress={streamingId===m.id?streamProgress:1}/>)}
+          {pendingHitl && (
+            <HitlCard pending={pendingHitl} onResume={onResume} busy={hitlBusy}/>
+          )}
           {loading && (
             <div className="msg agent-msg" style={{['--agent-color']:'var(--orch)', ['--agent-bg']:'var(--orch-bg)'}}>
               <div className="agent-card" style={{padding:'14px 18px'}}>
@@ -370,6 +448,9 @@ function App() {
   const [health, setHealth] = useState(null);
   const [sessions, setSessions] = useState(null);    // null = not yet loaded
   const [stats,    setStats]    = useState(null);
+  const [hitl,     setHitl]     = useState(false);   // operator-toggled per-session HITL flag
+  const [pendingHitl, setPendingHitl] = useState(null);  // {agent, title, prompt, options, runbooks, proposal_excerpt}
+  const [hitlBusy, setHitlBusy] = useState(false);
 
   // pick last agent message for default inspect
   useEffect(() => {
@@ -453,50 +534,80 @@ function App() {
     [inspectId, messages]
   );
 
+  // ── shared post-response handler — covers both /api/chat and /api/chat/resume
+  const ingestChatResponse = useCallback((data, t0) => {
+    const latencyMs = Math.round(performance.now() - t0);
+    if (data.session_id) setSessionId(data.session_id);
+    if (data.interrupted && data.interrupt) {
+      // Pause: render the operator-approval card, do NOT append the
+      // proposal as a final agent message yet — it'll come back with the
+      // resume response (possibly amended).
+      setPendingHitl({ ...data.interrupt, _t0: t0 });
+      return;
+    }
+    const agentMsg = {
+      id: uid('a'),
+      role: 'agent',
+      agent: data.agent,
+      time: nowTime(),
+      routedFrom: 'orchestrator',
+      routingReason: data.routing_reason || '—',
+      latencyMs: typeof data.latency_ms === 'number' ? Math.round(data.latency_ms) : latencyMs,
+      text: data.response,
+      trace: Array.isArray(data.trace) ? data.trace : [],
+      spans: [],
+    };
+    setMessages(prev => [...prev, agentMsg]);
+    setInspectId(agentMsg.id);
+    setPendingHitl(null);
+    refreshLiveData();
+  }, [refreshLiveData]);
+
   // ── send a message to /api/chat ────────────────────────────────────────────
   const handleSend = useCallback(async (text) => {
     const userMsg = { id: uid('u'), role: 'user', author: 'You', time: nowTime(), text };
     setMessages(prev => [...prev, userMsg]);
     setComposer('');
     setLoading(true);
+    setPendingHitl(null);
     const t0 = performance.now();
     try {
-      const data = await api.chat(text, sessionId);
-      const latencyMs = Math.round(performance.now() - t0);
-      if (!sessionId && data.session_id) setSessionId(data.session_id);
-      const agentMsg = {
-        id: uid('a'),
-        role: 'agent',
-        agent: data.agent,
-        time: nowTime(),
-        routedFrom: 'orchestrator',
-        routingReason: data.routing_reason || '—',
-        latencyMs: typeof data.latency_ms === 'number' ? Math.round(data.latency_ms) : latencyMs,
-        text: data.response,
-        // Real ReAct trace (thoughts + tool calls + results) from the server.
-        // Spans tab stays empty — those are exported async to Dash0.
-        trace: Array.isArray(data.trace) ? data.trace : [],
-        spans: [],
-        tokens: undefined,
-      };
-      setMessages(prev => [...prev, agentMsg]);
-      setInspectId(agentMsg.id);
-      // After a successful turn, refresh the rail + graph data
-      refreshLiveData();
+      const data = await api.chat(text, sessionId, hitl);
+      ingestChatResponse(data, t0);
     } catch (err) {
-      const errMsg = {
+      setMessages(prev => [...prev, {
         id: uid('e'), role: 'agent', agent: 'incident',
         time: nowTime(), routedFrom: 'orchestrator',
         routingReason: 'request failed',
         latencyMs: Math.round(performance.now() - t0),
         text: `**Error**\n\nCould not reach the agent backend: \`${err.message}\``,
         trace: [], spans: [],
-      };
-      setMessages(prev => [...prev, errMsg]);
+      }]);
     } finally {
       setLoading(false);
     }
-  }, [sessionId, refreshLiveData]);
+  }, [sessionId, hitl, ingestChatResponse]);
+
+  // ── resume a paused HITL session with the operator's choice ───────────────
+  const handleResume = useCallback(async (value) => {
+    if (!sessionId || !pendingHitl) return;
+    setHitlBusy(true);
+    const t0 = performance.now();
+    try {
+      const data = await api.resume(sessionId, value);
+      ingestChatResponse(data, t0);
+    } catch (err) {
+      setMessages(prev => [...prev, {
+        id: uid('e'), role: 'agent', agent: pendingHitl.agent || 'incident',
+        time: nowTime(), routingReason: 'resume failed',
+        text: `**Error**\n\nCould not resume the agent: \`${err.message}\``,
+        trace: [], spans: [],
+      }]);
+      setPendingHitl(null);
+    } finally {
+      setHitlBusy(false);
+    }
+  }, [sessionId, pendingHitl, ingestChatResponse]);
 
   // Operator clicks a session in the rail — load its messages and switch to it
   const handlePickSession = useCallback(async (sid) => {
@@ -541,7 +652,8 @@ function App() {
         <TopBar view={view} setView={setView}
           chaosMode={chaosMode} chaosOpen={chaosOpen}
           onChaosToggle={()=>setChaosOpen(o=>!o)}
-          onSimOpen={()=>setSimOpen(true)}/>
+          onSimOpen={()=>setSimOpen(true)}
+          hitl={hitl} onHitlToggle={()=>setHitl(v=>!v)}/>
 
         <Rail
           sessions={sessions}
@@ -560,7 +672,10 @@ function App() {
               loading={loading}
               onSend={handleSend}
               onClearSession={handleClearSession}
-              sessionId={sessionId}/>
+              sessionId={sessionId}
+              pendingHitl={pendingHitl}
+              onResume={handleResume}
+              hitlBusy={hitlBusy}/>
           )}
           {view === 'graph' && (
             <OrchestratorGraph

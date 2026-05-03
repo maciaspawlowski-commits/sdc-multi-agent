@@ -26,6 +26,7 @@ as needed (RAG search, domain calculations), receives results, and produces
 a final answer before exiting to END.
 """
 
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import tools_condition
 
@@ -36,6 +37,7 @@ from .agents.change import change_node
 from .agents.problem import problem_node
 from .agents.service import service_node
 from .agents.sla import sla_node
+from .agents.hitl import hitl_review_node
 from .agents.tracing import make_instrumented_tool_node
 
 
@@ -78,6 +80,12 @@ def build_graph() -> object:
     g.add_node("service_tools",  make_instrumented_tool_node(get_service_tools(),  "service_tools"))
     g.add_node("sla_tools",      make_instrumented_tool_node(get_sla_tools(),      "sla_tools"))
 
+    # ── HITL review node (one node, branches on current_agent) ───────────────
+    # Sits between every specialist's "final answer" branch and END.  No-op
+    # when state["hitl_enabled"] is False; otherwise pauses for operator
+    # approval via langgraph.types.interrupt().
+    g.add_node("hitl", hitl_review_node)
+
     # ── Entry point ──────────────────────────────────────────────────────────
     g.set_entry_point("orchestrator")
 
@@ -104,12 +112,19 @@ def build_graph() -> object:
             tools_condition,
             {
                 "tools": f"{agent}_tools",
-                END: END,
+                END: "hitl",   # was END — now route through the review checkpoint first
             },
         )
         g.add_edge(f"{agent}_tools", agent)
 
-    return g.compile()
+    # After the operator has approved/rejected, the graph terminates.
+    g.add_edge("hitl", END)
+
+    # MemorySaver gives us per-thread state persistence across an interrupt's
+    # pause/resume cycle.  thread_id is supplied by the caller (we use the
+    # session id).  Single-pod sufficient — for multi-pod we'd swap in a
+    # Redis-backed checkpointer.
+    return g.compile(checkpointer=MemorySaver())
 
 
 # Module-level singleton — compiled once at import time

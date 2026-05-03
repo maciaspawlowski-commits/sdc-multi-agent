@@ -41,6 +41,7 @@ from sdc import chaos as chaos_module
 from sdc.chaos import ChaosCallback
 from sdc.graph import sdc_graph
 from sdc.simulation.black_friday import get_black_friday_steps
+from langgraph.types import Command
 from sdc.state import AGENT_ICONS, AGENT_NAMES
 from sdc_otel import SDCToolsCallback
 
@@ -53,7 +54,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-APP_VERSION = os.getenv("APP_VERSION", "7.1.0")
+APP_VERSION = os.getenv("APP_VERSION", "7.2.0")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama3.2")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -286,6 +287,12 @@ if os.path.isdir(os.path.join(_STATIC_DIR, "console")):
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
+    hitl: bool = False              # if True, the agent's HITL node will pause for operator approval
+
+
+class ResumeRequest(BaseModel):
+    session_id: str
+    value: str                      # the operator's choice — "approve" / "reject" / a runbook id / "5-Whys" / etc.
 
 
 class ChatResponse(BaseModel):
@@ -300,6 +307,12 @@ class ChatResponse(BaseModel):
     # ReAct-style trace (thoughts + tool calls with their results) extracted
     # from the LangGraph result.  Drives the Operator Console's Inspector.
     trace: list = []
+    # When the graph paused at a HITL checkpoint, `interrupted` is True and
+    # `interrupt` carries the prompt payload (title, prompt, options, ...).
+    # In that case `response` holds the agent's proposal-so-far and the
+    # operator must POST /api/chat/resume to continue.
+    interrupted: bool = False
+    interrupt: Optional[dict] = None
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -368,6 +381,30 @@ def reset_chaos():
     return chaos_module.reset()
 
 
+def _graph_config(session_id: str) -> dict:
+    """Standard config for sdc_graph.ainvoke — wires the thread id (used by the
+    MemorySaver checkpointer for HITL pause/resume) and the OTel + chaos
+    callbacks.  Centralised so /api/chat and /api/chat/resume stay in sync.
+    """
+    return {
+        "configurable": {"thread_id": session_id},
+        "callbacks":    [_tools_callback, ChaosCallback()],
+    }
+
+
+def _interrupt_payload(result: dict) -> Optional[dict]:
+    """If the graph paused at an interrupt(), return the first pending payload
+    as a plain dict.  Otherwise None."""
+    interrupts = result.get("__interrupt__") if isinstance(result, dict) else None
+    if not interrupts:
+        return None
+    first = interrupts[0]
+    payload = getattr(first, "value", None)
+    if payload is None and isinstance(first, dict):
+        payload = first.get("value")
+    return payload if isinstance(payload, dict) else {"raw": str(payload)}
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     session_id = req.session_id or str(uuid.uuid4())
@@ -377,27 +414,26 @@ async def chat(req: ChatRequest):
         "sdc.agent.session",
         kind=trace.SpanKind.SERVER,
         attributes={
-            "session.id": session_id,
-            "llm.model": LLM_MODEL,
+            "session.id":         session_id,
+            "llm.model":          LLM_MODEL,
             "sdc.message.length": len(req.message),
+            "sdc.hitl.enabled":   bool(req.hitl),
         },
     ) as span:
         history = await _load_session(session_id)
         history.append(HumanMessage(content=req.message))
 
         initial_state = {
-            "messages": history,
-            "current_agent": None,
+            "messages":       history,
+            "current_agent":  None,
             "routing_reason": None,
+            "hitl_enabled":   bool(req.hitl),
         }
 
         # Propagate session.id via OTel baggage so every child span gets it
         _baggage_token = attach(baggage.set_baggage("session.id", session_id))
         try:
-            result = await sdc_graph.ainvoke(
-                initial_state,
-                config={"callbacks": [_tools_callback, ChaosCallback()]},
-            )
+            result = await sdc_graph.ainvoke(initial_state, config=_graph_config(session_id))
         except Exception as exc:
             latency_ms = (time.perf_counter() - t0) * 1000
             span.record_exception(exc)
@@ -410,63 +446,143 @@ async def chat(req: ChatRequest):
         finally:
             detach(_baggage_token)
 
-        ai_messages = [m for m in result["messages"] if hasattr(m, "type") and m.type == "ai"]
-        if not ai_messages:
-            raise HTTPException(status_code=502, detail="No response from agent")
-
-        last_ai = ai_messages[-1]
-        agent = result.get("current_agent", "incident")
-        routing_reason = result.get("routing_reason", "")
-        latency_ms = (time.perf_counter() - t0) * 1000
-
-        # Enrich the root span with routing outcome
-        span.set_attribute("sdc.agent", agent)
-        span.set_attribute("sdc.agent.name", AGENT_NAMES.get(agent, agent))
-        span.set_attribute("sdc.routing.reason", routing_reason)
-        span.set_attribute("sdc.latency_ms", round(latency_ms, 1))
-
-        # Metrics
-        attrs = {"sdc.agent": agent, "llm.model": LLM_MODEL}
-        _agent_counter.add(1, attrs)
-        _latency_hist.record(latency_ms, {**attrs, "status": "ok"})
-
-        # Trace for the Operator Console's Inspector — only emit the new
-        # tail (everything after the user message we just appended) so the
-        # client doesn't get the whole conversation as a trace each turn.
-        new_tail = result["messages"][len(history):]
-        trace_items = _extract_trace_from_messages(new_tail)
-        tool_call_count = sum(1 for t in trace_items if t.get("kind") == "tool")
-
-        # Persist full conversation for multi-turn
-        await _save_session(session_id, list(result["messages"]))
-        # Sidecar metadata so /api/sessions can list cheaply
-        await _save_session_meta(
-            session_id,
-            title=req.message,
-            last_agent=agent,
-            routing_reason=routing_reason,
-            msg_count=len(result["messages"]),
-            latency_ms=latency_ms,
+        return await _shape_chat_response(
+            result=result, session_id=session_id,
+            history_baseline=len(history) - 1,  # -1 so the user msg shows in the trace tail context
+            request_text=req.message, t0=t0, span=span,
         )
 
-        # Live counters for /api/stats (drives the Graph view)
-        _bump_stats(agent=agent, latency_ms=latency_ms, tool_calls=tool_call_count)
 
-        logger.info(
-            "chat ok session=%s agent=%s model=%s latency_ms=%.0f tools=%d routing=%s",
-            session_id, agent, LLM_MODEL, latency_ms, tool_call_count, routing_reason,
-        )
+async def _shape_chat_response(*, result, session_id, history_baseline, request_text, t0, span) -> ChatResponse:
+    """Build the ChatResponse from a graph result — handles both the normal
+    "agent finished" case and the HITL "graph paused at interrupt()" case.
+    """
+    latency_ms = (time.perf_counter() - t0) * 1000
+
+    # ── HITL pause path ─────────────────────────────────────────────────────
+    interrupt_payload = _interrupt_payload(result)
+    if interrupt_payload is not None:
+        agent = interrupt_payload.get("agent") or result.get("current_agent") or "incident"
+        # Best-effort: get the agent's proposal text from the most recent AI message
+        ai_messages = [m for m in result.get("messages", []) if hasattr(m, "type") and m.type == "ai"]
+        proposal_text = (ai_messages[-1].content if ai_messages else interrupt_payload.get("proposal_excerpt", "")) or ""
+
+        span.set_attribute("sdc.agent",            agent)
+        span.set_attribute("sdc.hitl.interrupted", True)
+        span.set_attribute("sdc.latency_ms",       round(latency_ms, 1))
+
+        logger.info("chat HITL paused session=%s agent=%s latency_ms=%.0f title=%s",
+                    session_id, agent, latency_ms, interrupt_payload.get("title"))
 
         return ChatResponse(
-            response=last_ai.content,
+            response=proposal_text,
             agent=agent,
             agent_name=AGENT_NAMES.get(agent, agent),
             agent_icon=AGENT_ICONS.get(agent, "🤖"),
-            routing_reason=routing_reason,
+            routing_reason=result.get("routing_reason", "") or "(awaiting operator approval)",
             session_id=session_id,
             model=LLM_MODEL,
             latency_ms=round(latency_ms, 1),
-            trace=trace_items,
+            trace=[],
+            interrupted=True,
+            interrupt=interrupt_payload,
+        )
+
+    # ── Normal completion path ──────────────────────────────────────────────
+    ai_messages = [m for m in result["messages"] if hasattr(m, "type") and m.type == "ai"]
+    if not ai_messages:
+        raise HTTPException(status_code=502, detail="No response from agent")
+
+    last_ai = ai_messages[-1]
+    agent = result.get("current_agent", "incident")
+    routing_reason = result.get("routing_reason", "")
+
+    # Enrich the root span with routing outcome
+    span.set_attribute("sdc.agent",          agent)
+    span.set_attribute("sdc.agent.name",     AGENT_NAMES.get(agent, agent))
+    span.set_attribute("sdc.routing.reason", routing_reason)
+    span.set_attribute("sdc.latency_ms",     round(latency_ms, 1))
+
+    # Metrics
+    attrs = {"sdc.agent": agent, "llm.model": LLM_MODEL}
+    _agent_counter.add(1, attrs)
+    _latency_hist.record(latency_ms, {**attrs, "status": "ok"})
+
+    # Trace for the Operator Console's Inspector — slice the new tail.
+    new_tail = result["messages"][history_baseline + 1:]
+    trace_items = _extract_trace_from_messages(new_tail)
+    tool_call_count = sum(1 for t in trace_items if t.get("kind") == "tool")
+
+    # Persist full conversation for multi-turn
+    await _save_session(session_id, list(result["messages"]))
+    await _save_session_meta(
+        session_id,
+        title=request_text,
+        last_agent=agent,
+        routing_reason=routing_reason,
+        msg_count=len(result["messages"]),
+        latency_ms=latency_ms,
+    )
+
+    _bump_stats(agent=agent, latency_ms=latency_ms, tool_calls=tool_call_count)
+
+    logger.info("chat ok session=%s agent=%s model=%s latency_ms=%.0f tools=%d routing=%s",
+                session_id, agent, LLM_MODEL, latency_ms, tool_call_count, routing_reason)
+
+    return ChatResponse(
+        response=last_ai.content,
+        agent=agent,
+        agent_name=AGENT_NAMES.get(agent, agent),
+        agent_icon=AGENT_ICONS.get(agent, "🤖"),
+        routing_reason=routing_reason,
+        session_id=session_id,
+        model=LLM_MODEL,
+        latency_ms=round(latency_ms, 1),
+        trace=trace_items,
+    )
+
+
+@app.post("/api/chat/resume", response_model=ChatResponse)
+async def chat_resume(req: ResumeRequest):
+    """Resume a paused HITL graph with the operator's choice.
+
+    The operator's `value` (e.g. "approve", "reject", "5-Whys", a runbook id)
+    becomes the return value of the agent's interrupt() call.  The graph then
+    runs to completion (or pauses again at the next checkpoint).
+    """
+    session_id = req.session_id
+    t0 = time.perf_counter()
+    with _tracer.start_as_current_span(
+        "sdc.agent.session.resume",
+        kind=trace.SpanKind.SERVER,
+        attributes={
+            "session.id":      session_id,
+            "sdc.hitl.value":  req.value[:120],
+        },
+    ) as span:
+        _baggage_token = attach(baggage.set_baggage("session.id", session_id))
+        try:
+            result = await sdc_graph.ainvoke(
+                Command(resume=req.value),
+                config=_graph_config(session_id),
+            )
+        except Exception as exc:
+            latency_ms = (time.perf_counter() - t0) * 1000
+            span.record_exception(exc)
+            span.set_attribute("error.type", type(exc).__name__)
+            _bump_stats(agent="unknown", latency_ms=latency_ms, error=True)
+            logger.error("Graph resume failed session=%s error=%s", session_id, exc)
+            raise HTTPException(status_code=502, detail=f"Resume error: {exc}")
+        finally:
+            detach(_baggage_token)
+
+        # The "previous" history isn't available here cleanly — pass len(messages)
+        # as the baseline so the trace covers everything that happened post-resume.
+        prior = list(result.get("messages") or [])
+        return await _shape_chat_response(
+            result=result, session_id=session_id,
+            history_baseline=max(0, len(prior) - 4),  # show last few new entries
+            request_text=f"(resume: {req.value})", t0=t0, span=span,
         )
 
 
@@ -950,6 +1066,29 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; 
 }}
 .chaos-toggle-btn:hover {{ border-color: #f85149; color: #f85149; }}
 .chaos-toggle-btn.active {{ background: rgba(248,81,73,.15); border-color: #f85149; color: #f85149; animation: pulse 1.5s ease-in-out infinite; }}
+#hitl-btn:hover {{ border-color: #58a6ff; color: #58a6ff; }}
+#hitl-btn.active {{ background: rgba(88,166,255,.18); border-color: #58a6ff; color: #58a6ff; animation: none; }}
+
+/* ── HITL approval card ── */
+.hitl-card {{ display: flex; flex-direction: column; gap: 10px; }}
+.hitl-title {{ font-weight: 700; font-size: .92rem; color: var(--fg); letter-spacing: .01em; }}
+.hitl-prompt {{ font-size: .82rem; color: var(--muted); line-height: 1.5; }}
+.hitl-proposal {{
+  border-left: 2px solid #58a6ff; padding: 6px 12px; margin: 4px 0;
+  background: rgba(88,166,255,.06); border-radius: 4px; font-style: italic;
+  font-size: .78rem; color: var(--muted); max-height: 180px; overflow: auto;
+}}
+.hitl-section-title {{ font-size: .68rem; color: var(--muted); letter-spacing: .08em; margin-top: 4px; }}
+.hitl-runbooks {{ display: flex; flex-wrap: wrap; gap: 6px; }}
+.hitl-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }}
+.hitl-opt {{
+  background: var(--bg); border: 1px solid var(--border); color: var(--fg);
+  border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: .78rem;
+  font-weight: 600; transition: all .15s;
+}}
+.hitl-opt:hover:not(:disabled) {{ background: var(--surface); border-color: #58a6ff; color: #58a6ff; }}
+.hitl-opt:disabled {{ opacity: .4; cursor: default; }}
+.hitl-opt.hitl-danger:hover:not(:disabled) {{ border-color: #f85149; color: #f85149; }}
 
 .chaos-panel {{
   background: var(--surface); border-bottom: 2px solid #f85149;
@@ -994,6 +1133,9 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; 
   </button>
   <button class="chaos-toggle-btn" id="chaos-btn" onclick="toggleChaosPanel()" title="Inject failures to test observability">
     🔥 Chaos
+  </button>
+  <button class="chaos-toggle-btn" id="hitl-btn" onclick="toggleHitl()" title="Human-in-the-loop: each specialist agent pauses for operator approval before its final answer">
+    ✋ HITL <span id="hitl-state">off</span>
   </button>
 </div>
 
@@ -1172,6 +1314,89 @@ function agentTag(agent, agentName, icon) {{
   return `<span class="agent-tag tag-${{agent}}">${{icon}} ${{agentName}}</span>`;
 }}
 
+// HITL toggle state — when on, /api/chat requests pass hitl: true so the
+// graph pauses at the agent's review checkpoint and surfaces an approval
+// card.  Resume via POST /api/chat/resume with the operator's choice.
+let hitlEnabled = false;
+function toggleHitl() {{
+  hitlEnabled = !hitlEnabled;
+  document.getElementById('hitl-state').textContent = hitlEnabled ? 'on' : 'off';
+  document.getElementById('hitl-btn').classList.toggle('active', hitlEnabled);
+}}
+
+function renderHitlCard(pending, payload) {{
+  const opts = payload.options || ['approve','reject'];
+  const runbooks = payload.runbooks || [];
+  const optsHtml = opts.map(o => {{
+    const danger = /^(reject|deny|cancel)$/i.test(o);
+    return `<button class="hitl-opt${{danger ? ' hitl-danger' : ''}}" data-val="${{escHtml(o)}}">${{escHtml(o)}}</button>`;
+  }}).join('');
+  const runbookHtml = runbooks.length === 0 ? '' : `
+    <div class="hitl-section-title">RUNBOOK CHOICES</div>
+    <div class="hitl-runbooks">
+      ${{runbooks.map(rb => `<button class="hitl-opt" data-val="${{escHtml(rb)}}">${{escHtml(rb)}}</button>`).join('')}}
+    </div>`;
+  pending.querySelector('.msg-bubble').innerHTML = `
+    <div class="hitl-card">
+      <div class="hitl-title">✋ ${{escHtml(payload.title || 'Operator approval required')}}</div>
+      <div class="hitl-prompt">${{escHtml(payload.prompt || '')}}</div>
+      ${{payload.proposal_excerpt ? `<blockquote class="hitl-proposal">${{escHtml(payload.proposal_excerpt).replace(/\\n/g,'<br>')}}</blockquote>` : ''}}
+      ${{runbookHtml}}
+      <div class="hitl-actions">${{optsHtml}}</div>
+    </div>`;
+  pending.querySelectorAll('.hitl-opt').forEach(b => {{
+    b.addEventListener('click', async () => {{
+      pending.querySelectorAll('.hitl-opt').forEach(x => x.disabled = true);
+      await resumeChat(b.getAttribute('data-val'), pending);
+    }});
+  }});
+}}
+
+async function resumeChat(value, pending) {{
+  pending.querySelector('.msg-meta').innerHTML =
+    '<span class="thinking">Resuming agent with: ' + escHtml(value) + '…</span>';
+  try {{
+    const res = await fetch('/api/chat/resume', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{ session_id: sessionId, value: value }}),
+    }});
+    if (!res.ok) {{
+      const err = await res.json().catch(() => ({{detail: 'Resume failed'}}));
+      pending.querySelector('.msg-bubble').innerHTML =
+        '<span style="color:#f85149">⚠ Resume error: ' + escHtml(err.detail || 'Unknown error') + '</span>';
+      return;
+    }}
+    const data = await res.json();
+    paintChatResponse(data, pending);
+  }} catch (err) {{
+    pending.querySelector('.msg-bubble').innerHTML =
+      '<span style="color:#f85149">⚠ Network error: ' + escHtml(err.message) + '</span>';
+  }}
+}}
+
+function paintChatResponse(data, pending) {{
+  if (data.session_id) sessionId = data.session_id;
+  if (data.interrupted && data.interrupt) {{
+    renderHitlCard(pending, data.interrupt);
+    pending.querySelector('.msg-meta').innerHTML =
+      agentTag(data.agent, data.agent_name, data.agent_icon) +
+      `<span>session: ${{(data.session_id || sessionId).slice(0,8)}}…</span>` +
+      `<span style="color:#f85149">paused — operator approval required</span>`;
+    return;
+  }}
+  renderAgentList(data.agent);
+  document.getElementById('orch-status').textContent = '✓ Routed';
+  const rb = document.getElementById('routing-badge');
+  rb.textContent = data.routing_reason ? '→ ' + data.routing_reason : '';
+  rb.style.display = data.routing_reason ? 'inline-block' : 'none';
+  pending.querySelector('.msg-bubble').innerHTML = escHtml(data.response).replace(/\\n/g, '<br>');
+  pending.querySelector('.msg-meta').innerHTML =
+    agentTag(data.agent, data.agent_name, data.agent_icon) +
+    `<span>${{data.model}}</span>` +
+    `<span>session: ${{(data.session_id || sessionId).slice(0,8)}}…</span>`;
+}}
+
 async function send() {{
   const msg = input.value.trim();
   if (!msg || sendBtn.disabled) return;
@@ -1182,17 +1407,14 @@ async function send() {{
 
   addMsg('user', escHtml(msg).replace(/\\n/g, '<br>'));
   const pending = addMsg('assistant', '<span class="thinking">Routing to specialist agent…</span>');
-
-  // Show orchestrator as "routing"
   document.getElementById('orch-status').textContent = '⟳ Routing…';
 
   try {{
     const res = await fetch('/api/chat', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{ message: msg, session_id: sessionId }}),
+      body: JSON.stringify({{ message: msg, session_id: sessionId, hitl: hitlEnabled }}),
     }});
-
     if (!res.ok) {{
       const err = await res.json().catch(() => ({{detail: 'Request failed'}}));
       pending.querySelector('.msg-bubble').innerHTML =
@@ -1200,24 +1422,7 @@ async function send() {{
       pending.querySelector('.msg-meta').textContent = '';
       return;
     }}
-
-    const data = await res.json();
-
-    // Update sidebar
-    renderAgentList(data.agent);
-    document.getElementById('orch-status').textContent = '✓ Routed';
-    const rb = document.getElementById('routing-badge');
-    rb.textContent = data.routing_reason ? '→ ' + data.routing_reason : '';
-    rb.style.display = data.routing_reason ? 'inline-block' : 'none';
-
-    // Render response
-    const formatted = escHtml(data.response).replace(/\\n/g, '<br>');
-    pending.querySelector('.msg-bubble').innerHTML = formatted;
-    const meta = agentTag(data.agent, data.agent_name, data.agent_icon) +
-      `<span>${{data.model}}</span>` +
-      `<span>session: ${{data.session_id.slice(0,8)}}…</span>`;
-    pending.querySelector('.msg-meta').innerHTML = meta;
-
+    paintChatResponse(await res.json(), pending);
   }} catch (err) {{
     pending.querySelector('.msg-bubble').innerHTML =
       `<span style="color:#f85149">⚠ Network error: ${{escHtml(err.message)}}</span>`;
