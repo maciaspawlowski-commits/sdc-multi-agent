@@ -43,8 +43,12 @@ spec:
                   value: "http://sdc-agents:8000"
                 - name: CANARY_TIMEOUT_SECS
                   value: "360"
-                - name: CANARY_QUESTION
-                  value: "What is the SLA target and escalation path for a P1 incident?"
+                # CANARY_QUESTION is intentionally unset — sdc/canary.py
+                # rotates through 5 curated prompts (one per specialist agent),
+                # picking one based on floor(now / 600s) % 5.  Across an hour
+                # the canary exercises every agent at least once.
+                # Set CANARY_QUESTION here only to pin a single prompt for
+                # debugging — that short-circuits the rotation.
               resources:
                 requests:
                   memory: "256Mi"

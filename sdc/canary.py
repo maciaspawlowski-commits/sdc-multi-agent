@@ -43,14 +43,57 @@ logger = logging.getLogger("sdc.canary")
 # ── Config from environment ───────────────────────────────────────────────────
 SVC_URL       = os.getenv("SVC_URL",           "http://sdc-agents:8000")
 TIMEOUT_SECS  = int(os.getenv("CANARY_TIMEOUT_SECS", "45"))
-CANARY_Q      = os.getenv(
-    "CANARY_QUESTION",
-    "What is the SLA target and escalation path for a P1 incident?",
-)
 ENDPOINT      = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "").rstrip("/")
 AUTH_TOKEN    = os.getenv("DASH0_AUTH_TOKEN",  "")
 SERVICE_NAME  = os.getenv("OTEL_SERVICE_NAME", "sdc-canary")
 ENVIRONMENT   = os.getenv("ENVIRONMENT",       "k8s")
+
+# ── Canary rotation ──────────────────────────────────────────────────────────
+# One curated prompt per specialist.  The probe rotates through these so the
+# orchestrator's routing logic is exercised across all five agents within
+# every full cycle (50 min at the default 10-min CronJob cadence).
+#
+# These match the suggestion chips in the Operator Console (static/console/
+# data.js → window.SUGGESTIONS) so the canary signal is comparable to what
+# real operators would send.
+#
+# To force a single fixed prompt (e.g. for debugging), set CANARY_QUESTION
+# in the environment — it short-circuits the rotation.
+CANARY_QUESTIONS: list[tuple[str, str]] = [
+    ("incident",
+     "Our payment gateway is completely down and approximately 450,000 customers are "
+     "affected. Revenue is being lost. There is no workaround. What priority is this "
+     "and what do we do?"),
+    ("change",
+     "I need to push an emergency hotfix for the auth service tonight at 22:00 UTC. "
+     "The fix has been validated in staging. Walk me through the CAB approval path."),
+    ("problem",
+     "We have had 4 incidents in the last 60 days caused by the payment DB connection "
+     "pool. Should we open a problem record and what RCA method should we use?"),
+    ("service",
+     "I need monitoring and incident-management read access for 3 emergency "
+     "contractors helping us with the Black Friday war room. Fastest path?"),
+    ("sla",
+     "Our P2 SLA compliance dropped to 78% this month against a 95% target. What "
+     "does that mean and what actions should we take?"),
+]
+
+_OVERRIDE_Q = os.getenv("CANARY_QUESTION", "").strip()
+
+
+def pick_question() -> tuple[str, str]:
+    """Return (expected_agent, prompt) for this canary run.
+
+    Rotation is keyed off the wall clock so multiple replicas / restarts
+    don't all land on the same prompt: floor(now / cadence) % N picks the
+    bucket.  The cadence (10 min) matches the CronJob schedule, so each
+    run advances by one.
+    """
+    if _OVERRIDE_Q:
+        return ("?", _OVERRIDE_Q)
+    cadence = 600  # seconds — must match the CronJob schedule
+    idx = int(time.time() // cadence) % len(CANARY_QUESTIONS)
+    return CANARY_QUESTIONS[idx]
 
 
 # ── OTel bootstrap ────────────────────────────────────────────────────────────
@@ -121,39 +164,44 @@ def run() -> int:
     """Execute one canary probe. Returns 0 on success, 1 on failure."""
     tracer, lat_hist, req_ctr, up_gauge, tp, mp = _setup()
 
-    url    = f"{SVC_URL}/api/chat"
+    url = f"{SVC_URL}/api/chat"
+    expected_agent, canary_q = pick_question()
     status = "ok"
     latency_ms = 0.0
+    actual_agent = "unknown"
 
     with tracer.start_as_current_span(
         "sdc.canary.probe",
         attributes={
-            "canary.url":      url,
-            "canary.question": CANARY_Q[:200],
-            "canary.timeout":  TIMEOUT_SECS,
+            "canary.url":            url,
+            "canary.question":       canary_q[:200],
+            "canary.expected_agent": expected_agent,
+            "canary.timeout":        TIMEOUT_SECS,
         },
     ) as span:
         t0 = time.perf_counter()
         try:
             resp = _requests.post(
                 url,
-                json={"message": CANARY_Q},
+                json={"message": canary_q},
                 timeout=TIMEOUT_SECS,
             )
             latency_ms = (time.perf_counter() - t0) * 1000
 
             if resp.status_code == 200:
-                data  = resp.json()
-                agent = data.get("agent", "unknown")
-                span.set_attribute("canary.status",       "ok")
-                span.set_attribute("canary.http_status",  resp.status_code)
-                span.set_attribute("canary.latency_ms",   round(latency_ms, 1))
-                span.set_attribute("canary.agent",        agent)
-                span.set_attribute("canary.response_len", len(data.get("response", "")))
+                data         = resp.json()
+                actual_agent = data.get("agent", "unknown")
+                routed_ok    = (expected_agent == "?") or (actual_agent == expected_agent)
+                span.set_attribute("canary.status",            "ok")
+                span.set_attribute("canary.http_status",       resp.status_code)
+                span.set_attribute("canary.latency_ms",        round(latency_ms, 1))
+                span.set_attribute("canary.agent",             actual_agent)
+                span.set_attribute("canary.routed_correctly",  routed_ok)
+                span.set_attribute("canary.response_len",      len(data.get("response", "")))
                 span.set_status(StatusCode.OK)
                 logger.info(
-                    "✅ Canary OK  agent=%s latency_ms=%.0f url=%s",
-                    agent, latency_ms, url,
+                    "✅ Canary OK  expected=%s actual=%s routed_ok=%s latency_ms=%.0f",
+                    expected_agent, actual_agent, routed_ok, latency_ms,
                 )
             else:
                 status = "error"
@@ -165,11 +213,12 @@ def run() -> int:
         except _requests.Timeout:
             latency_ms = (time.perf_counter() - t0) * 1000
             status = "timeout"
-            span.set_attribute("canary.status",   "timeout")
+            span.set_attribute("canary.status",     "timeout")
             span.set_attribute("canary.latency_ms", round(latency_ms, 1))
             span.record_exception(TimeoutError(f"No response within {TIMEOUT_SECS}s"))
             span.set_status(StatusCode.ERROR, f"Timeout after {TIMEOUT_SECS}s")
-            logger.error("⏱  Canary TIMEOUT after %ds url=%s", TIMEOUT_SECS, url)
+            logger.error("⏱  Canary TIMEOUT after %ds expected=%s url=%s",
+                         TIMEOUT_SECS, expected_agent, url)
 
         except Exception as exc:
             latency_ms = (time.perf_counter() - t0) * 1000
@@ -178,13 +227,18 @@ def run() -> int:
             span.set_attribute("canary.latency_ms", round(latency_ms, 1))
             span.record_exception(exc)
             span.set_status(StatusCode.ERROR, str(exc))
-            logger.error("❌ Canary error: %s  url=%s", exc, url)
+            logger.error("❌ Canary error: %s expected=%s url=%s", exc, expected_agent, url)
 
-        # Emit metrics (recorded inside the active span → exemplars captured)
-        attrs = {"canary.status": status}
+        # Emit metrics — labelled with the rotated prompt's expected agent so
+        # Dash0 can show per-agent canary latency & success rate panels.
+        attrs = {
+            "canary.status":         status,
+            "canary.expected_agent": expected_agent,
+            "canary.actual_agent":   actual_agent,
+        }
         lat_hist.record(latency_ms, attrs)
         req_ctr.add(1, attrs)
-        up_gauge.set(0.0 if status != "ok" else 1.0, {})
+        up_gauge.set(0.0 if status != "ok" else 1.0, {"canary.expected_agent": expected_agent})
 
     # Shutdown flushes the BatchSpanProcessor and triggers a final metric export
     tp.shutdown()
