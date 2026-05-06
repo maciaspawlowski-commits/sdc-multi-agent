@@ -78,18 +78,28 @@ foreach ($port in 8000, 11434, 8001, 6379) {
 
 $logDir = "$env:TEMP\sdc-pf"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+
+# Each forward declares whether to bind to 0.0.0.0 (LAN reachable) or 127.0.0.1
+# (loopback only). sdc-agents is the public surface that the Operator Console
+# is served from -- bound to 0.0.0.0 so other devices on the same Wi-Fi
+# (e.g. a phone or another laptop) can reach http://<host-LAN-IP>:8000/console/.
+# The Windows Firewall rule "SDC Operator Console (8000)" must exist for this
+# to actually be reachable from the LAN; see scripts/lan-access.md.
+# The other three (ollama / chromadb / redis) stay loopback-only -- they're
+# internal infrastructure, no need to expose them.
 $forwards = @(
-    @{svc='sdc-agents'; local=8000;  remote=8000},
-    @{svc='ollama';     local=11434; remote=11434},
-    @{svc='chromadb';   local=8001;  remote=8000},
-    @{svc='redis';      local=6379;  remote=6379}
+    @{svc='sdc-agents'; local=8000;  remote=8000;  address='0.0.0.0'},
+    @{svc='ollama';     local=11434; remote=11434; address='127.0.0.1'},
+    @{svc='chromadb';   local=8001;  remote=8000;  address='127.0.0.1'},
+    @{svc='redis';      local=6379;  remote=6379;  address='127.0.0.1'}
 )
 foreach ($f in $forwards) {
     Start-Process -NoNewWindow -FilePath 'kubectl' `
-        -ArgumentList 'port-forward', '-n', 'sdc', "svc/$($f.svc)", "$($f.local):$($f.remote)" `
+        -ArgumentList 'port-forward', '--address', $f.address, '-n', 'sdc', "svc/$($f.svc)", "$($f.local):$($f.remote)" `
         -RedirectStandardOutput "$logDir\$($f.svc).log" `
         -RedirectStandardError  "$logDir\$($f.svc).err" | Out-Null
-    Write-Host "  $($f.svc): localhost:$($f.local)" -ForegroundColor Green
+    $bind = if ($f.address -eq '0.0.0.0') { 'LAN' } else { 'localhost' }
+    Write-Host "  $($f.svc): $bind`:$($f.local)" -ForegroundColor Green
 }
 
 Start-Sleep -Seconds 3
