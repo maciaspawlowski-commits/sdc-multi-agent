@@ -149,7 +149,7 @@ data:
         timeout: 5s
 
     exporters:
-      # ── App traces + logs → Elastic APM (OTLP) ───────────────────────────
+      # ── App traces + logs → Elastic ESS APM (OTLP) ───────────────────────
       otlp_http/elastic:
         endpoint: https://3d35c931548344669d9fc974836bc316.apm.us-central1.gcp.cloud.es.io:443
         headers:
@@ -160,7 +160,18 @@ data:
           max_interval: 60s
           max_elapsed_time: 300s
 
-      # ── K8s infra metrics → Elasticsearch (OTel mode) ────────────────────
+      # ── App traces + logs → Elastic Serverless APM (OTLP) ────────────────
+      otlp_http/elastic_serverless:
+        endpoint: https://hubble-project-d8a7db.apm.europe-west1.gcp.elastic.cloud
+        headers:
+          Authorization: "ApiKey ${env:ELASTIC_SERVERLESS_API_KEY}"
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 60s
+          max_elapsed_time: 300s
+
+      # ── K8s infra metrics → Elastic ESS (OTel mode) ──────────────────────
       # mapping.mode: otel promotes k8s.* resource attributes to top-level
       # document fields so ES|QL and the [Kubernetes OTel] dashboards work.
       # This is the path the official EDOT Helm chart uses; otlphttp (APM
@@ -172,6 +183,14 @@ data:
         mapping:
           mode: otel
 
+      # ── K8s infra metrics → Elastic Serverless (OTel mode) ───────────────
+      elasticsearch/otel_serverless:
+        endpoints:
+          - https://hubble-project-d8a7db.es.europe-west1.gcp.elastic.cloud
+        api_key: "${env:ELASTIC_SERVERLESS_API_KEY}"
+        mapping:
+          mode: otel
+
     service:
       extensions: [health_check]
       telemetry:
@@ -179,26 +198,29 @@ data:
           level: warn
       pipelines:
         # App traces (LangGraph nodes, LLM calls, FastAPI requests, tools)
+        # Fan-out → ESS APM + Serverless APM
         traces:
           receivers: [otlp]
           processors: [memory_limiter, k8s_attributes, transform/agent_name, batch]
-          exporters: [otlp_http/elastic]
+          exporters: [otlp_http/elastic, otlp_http/elastic_serverless]
 
         # K8s cluster + node/pod/container resource metrics
-        # → ES exporter with otel mode so k8s.* fields are top-level in ES|QL
+        # Fan-out → ESS ES + Serverless ES (both with otel mapping mode)
         metrics/infra:
           receivers: [k8s_cluster, kubeletstats]
           processors: [memory_limiter, resourcedetection, resource/k8s, batch/metrics]
-          exporters: [elasticsearch/otel]
+          exporters: [elasticsearch/otel, elasticsearch/otel_serverless]
 
         # App metrics from sdc-agents (OTel SDK)
+        # Fan-out → ESS APM + Serverless APM
         metrics/app:
           receivers: [otlp]
           processors: [memory_limiter, batch]
-          exporters: [otlp_http/elastic]
+          exporters: [otlp_http/elastic, otlp_http/elastic_serverless]
 
         # Structured logs from sdc-agents
+        # Fan-out → ESS APM + Serverless APM
         logs:
           receivers: [otlp]
           processors: [memory_limiter, k8s_attributes, batch]
-          exporters: [otlp_http/elastic]
+          exporters: [otlp_http/elastic, otlp_http/elastic_serverless]

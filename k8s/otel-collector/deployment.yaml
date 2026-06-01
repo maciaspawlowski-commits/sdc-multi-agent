@@ -51,6 +51,11 @@ spec:
                 secretKeyRef:
                   name: otel-collector-secrets
                   key: ELASTIC_ES_API_KEY
+            - name: ELASTIC_SERVERLESS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: otel-collector-secrets
+                  key: ELASTIC_SERVERLESS_API_KEY
             # Required by kubeletstats receiver and resourcedetection/k8snode.
             # Tells the receiver which node's Kubelet to scrape.
             - name: K8S_NODE_NAME
