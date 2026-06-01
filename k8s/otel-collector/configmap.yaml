@@ -1,0 +1,204 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: sdc
+data:
+  config.yaml: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    receivers:
+      # ── App telemetry from sdc-agents ─────────────────────────────────────
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+      # ── Kubernetes cluster-level metrics ──────────────────────────────────
+      k8s_cluster:
+        auth_type: serviceAccount
+        collection_interval: 30s
+        node_conditions_to_report: [Ready, MemoryPressure, DiskPressure, PIDPressure]
+        allocatable_types_to_report: [cpu, memory]
+        # Enable resource attributes that are off by default — needed for
+        # the [Kubernetes OTel] dashboards (os.type, kubelet version, etc.)
+        resource_attributes:
+          k8s.kubelet.version:
+            enabled: true
+          os.description:
+            enabled: true
+          os.type:
+            enabled: true
+        metrics:
+          k8s.pod.status_reason:
+            enabled: true
+
+      # ── Kubelet stats — node + pod + container resource metrics ───────────
+      kubeletstats:
+        auth_type: serviceAccount
+        collection_interval: 30s
+        endpoint: "https://${env:K8S_NODE_NAME}:10250"
+        # node is required for *utilization metrics (pod/container CPU/mem
+        # relative to node capacity) — must match K8S_NODE_NAME.
+        node: "${env:K8S_NODE_NAME}"
+        insecure_skip_verify: true
+        metric_groups:
+          - node
+          - pod
+          - container
+          - volume
+        # Enable utilization metrics required by [Kubernetes OTel] dashboards.
+        # In EDOT 9.4.1 the kubeletstats receiver follows OTel SemConv naming:
+        # container-level memory metrics use the container.* namespace (no k8s.
+        # prefix).  Most are disabled by default — enable the full set here so
+        # the [Kubernetes OTel] Namespaces and Containers dashboards work.
+        metrics:
+          k8s.node.uptime:
+            enabled: true
+          k8s.node.cpu.usage:
+            enabled: true
+          k8s.pod.cpu.usage:
+            enabled: true
+          k8s.pod.cpu.node.utilization:
+            enabled: true
+          k8s.pod.memory.node.utilization:
+            enabled: true
+          k8s.pod.cpu_limit_utilization:
+            enabled: true
+          k8s.pod.memory_limit_utilization:
+            enabled: true
+          k8s.container.cpu_limit_utilization:
+            enabled: true
+          k8s.container.memory_limit_utilization:
+            enabled: true
+          # NOTE: container.memory.major_page_faults and other container-level
+          # memory metrics (rss, usage, available, page_faults) have NO valid
+          # config key in EDOT 9.4.1 — neither container.* nor k8s.container.*
+          # forms are accepted. Only container.memory.working_set ships by
+          # default. The [Kubernetes OTel] "OOM events" panel will remain
+          # unavailable until Elastic adds these metrics to the receiver.
+        extra_metadata_labels:
+          - container.id
+
+    processors:
+      memory_limiter:
+        check_interval: 5s
+        limit_mib: 256
+        spike_limit_mib: 64
+
+      # k8s.cluster.name is not auto-detectable on minikube (no cloud API).
+      # Set it explicitly so all [Kubernetes OTel] dashboard filters work.
+      resource/k8s:
+        attributes:
+          - key: k8s.cluster.name
+            value: "minikube"
+            action: upsert
+
+      # Detect k8s.node.name, host.name, k8s.cluster.name, etc.
+      resourcedetection:
+        detectors: [env, k8snode]
+        k8snode:
+          auth_type: serviceAccount
+          node_from_env_var: K8S_NODE_NAME
+        timeout: 10s
+        override: false
+
+      # Enrich app spans/logs with pod metadata.
+      k8s_attributes:
+        auth_type: serviceAccount
+        passthrough: false
+        extract:
+          metadata:
+            - k8s.pod.name
+            - k8s.pod.uid
+            - k8s.namespace.name
+            - k8s.node.name
+            - k8s.deployment.name
+            - k8s.replicaset.name
+            - container.image.name
+            - container.image.tag
+        pod_association:
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.ip
+          - sources:
+              - from: connection
+
+      # Override the SDK-injected telemetry.sdk.name so Elastic APM shows
+      # "sdc-agents" as the agent identifier instead of "opentelemetry/python".
+      # The per-span agent.name attribute set in sdc_app.py then overrides this
+      # further at the transaction level for each individual agent type.
+      transform/agent_name:
+        trace_statements:
+          - context: resource
+            statements:
+              - set(attributes["telemetry.sdk.name"], "sdc-agents")
+
+      batch:
+        timeout: 5s
+        send_batch_size: 512
+
+      batch/metrics:
+        # send_batch_max_size: 0 avoids TSDB version_conflict_engine_exception
+        # when a batch is split mid-series.
+        send_batch_max_size: 0
+        timeout: 5s
+
+    exporters:
+      # ── App traces + logs → Elastic APM (OTLP) ───────────────────────────
+      otlp_http/elastic:
+        endpoint: https://3d35c931548344669d9fc974836bc316.apm.us-central1.gcp.cloud.es.io:443
+        headers:
+          Authorization: "Bearer ${env:ELASTIC_SECRET_TOKEN}"
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 60s
+          max_elapsed_time: 300s
+
+      # ── K8s infra metrics → Elasticsearch (OTel mode) ────────────────────
+      # mapping.mode: otel promotes k8s.* resource attributes to top-level
+      # document fields so ES|QL and the [Kubernetes OTel] dashboards work.
+      # This is the path the official EDOT Helm chart uses; otlphttp (APM
+      # endpoint) buries resource attributes and breaks those dashboards.
+      elasticsearch/otel:
+        endpoints:
+          - https://29d554633a7d4102a13c25f6aa2d1eb8.us-central1.gcp.cloud.es.io:443
+        api_key: "${env:ELASTIC_ES_API_KEY}"
+        mapping:
+          mode: otel
+
+    service:
+      extensions: [health_check]
+      telemetry:
+        logs:
+          level: warn
+      pipelines:
+        # App traces (LangGraph nodes, LLM calls, FastAPI requests, tools)
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, k8s_attributes, transform/agent_name, batch]
+          exporters: [otlp_http/elastic]
+
+        # K8s cluster + node/pod/container resource metrics
+        # → ES exporter with otel mode so k8s.* fields are top-level in ES|QL
+        metrics/infra:
+          receivers: [k8s_cluster, kubeletstats]
+          processors: [memory_limiter, resourcedetection, resource/k8s, batch/metrics]
+          exporters: [elasticsearch/otel]
+
+        # App metrics from sdc-agents (OTel SDK)
+        metrics/app:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [otlp_http/elastic]
+
+        # Structured logs from sdc-agents
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, k8s_attributes, batch]
+          exporters: [otlp_http/elastic]

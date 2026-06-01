@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: sdc
+  labels:
+    app: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+      annotations:
+        # Opt this pod out of Dash0 auto-instrumentation — the collector
+        # manages its own pipeline. Operator injection would create a loop.
+        dash0.com/instrument: "false"
+    spec:
+      serviceAccountName: otel-collector
+      containers:
+        - name: otel-collector
+          # EDOT = Elastic Distribution of OpenTelemetry.
+          # Includes the elasticinframetrics processor which promotes k8s.*
+          # resource attributes to top-level ES fields so the managed
+          # [Kubernetes OTel] dashboards in Elastic work out of the box.
+          image: docker.elastic.co/elastic-agent/elastic-otel-collector:9.4.1
+          imagePullPolicy: IfNotPresent
+          args:
+            # EDOT requires the file: URI scheme for --config
+            - "--config=file:/etc/otelcol-contrib/config.yaml"
+            # EDOT already emits k8s.node.cpu.usage (not the deprecated
+            # *.cpu.utilization) by default — no feature gate needed.
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: health
+              containerPort: 13133
+          env:
+            - name: ELASTIC_SECRET_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: otel-collector-secrets
+                  key: ELASTIC_SECRET_TOKEN
+            - name: ELASTIC_ES_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: otel-collector-secrets
+                  key: ELASTIC_ES_API_KEY
+            # Required by kubeletstats receiver and resourcedetection/k8snode.
+            # Tells the receiver which node's Kubelet to scrape.
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otelcol-contrib
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 13133
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 13133
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config

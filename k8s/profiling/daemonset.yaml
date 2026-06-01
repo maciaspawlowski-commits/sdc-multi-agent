@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pf-host-agent
+  namespace: profiling
+  labels:
+    app: pf-host-agent
+spec:
+  selector:
+    matchLabels:
+      app: pf-host-agent
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: pf-host-agent
+    spec:
+      # Required: see the full host process tree and kernel namespaces
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+
+      tolerations:
+        # Run on every node, including control-plane taints
+        - effect: NoSchedule
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
+
+      containers:
+        - name: pf-host-agent
+          image: docker.elastic.co/observability/pf-host-agent:9.4.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - -project-id=1
+            - -secret-token=$(SECRET_TOKEN)
+            - -collection-agent=3d35c931548344669d9fc974836bc316.profiling.us-central1.gcp.cloud.es.io:443
+          env:
+            - name: SECRET_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: profiling-secrets
+                  key: secret-token
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          resources:
+            requests:
+              cpu: 100m
+              memory: 100Mi
+            limits:
+              cpu: 500m
+              memory: 500Mi
+          volumeMounts:
+            - name: proc
+              mountPath: /proc
+              readOnly: true
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+              readOnly: true
+            - name: sys
+              mountPath: /sys
+              readOnly: true
+            - name: debugfs
+              mountPath: /sys/kernel/debug
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+            - name: machine-id
+              mountPath: /etc/machine-id
+              readOnly: true
+
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: debugfs
+          hostPath:
+            path: /sys/kernel/debug
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+        - name: machine-id
+          hostPath:
+            path: /etc/machine-id
+            type: FileOrCreate

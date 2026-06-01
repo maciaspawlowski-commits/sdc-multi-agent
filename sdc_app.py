@@ -409,6 +409,10 @@ def _interrupt_payload(result: dict) -> Optional[dict]:
 async def chat(req: ChatRequest):
     session_id = req.session_id or str(uuid.uuid4())
     t0 = time.perf_counter()
+    # Capture the FastAPI HTTP span *before* creating the child session span.
+    # We'll rename it once we know which agent handled the request so that
+    # Elastic APM transaction names show "POST /api/chat [incident]" etc.
+    http_span = trace.get_current_span()
 
     with _tracer.start_as_current_span(
         "sdc.agent.session",
@@ -449,11 +453,11 @@ async def chat(req: ChatRequest):
         return await _shape_chat_response(
             result=result, session_id=session_id,
             history_baseline=len(history) - 1,  # -1 so the user msg shows in the trace tail context
-            request_text=req.message, t0=t0, span=span,
+            request_text=req.message, t0=t0, span=span, http_span=http_span,
         )
 
 
-async def _shape_chat_response(*, result, session_id, history_baseline, request_text, t0, span) -> ChatResponse:
+async def _shape_chat_response(*, result, session_id, history_baseline, request_text, t0, span, http_span=None) -> ChatResponse:
     """Build the ChatResponse from a graph result — handles both the normal
     "agent finished" case and the HITL "graph paused at interrupt()" case.
     """
@@ -467,6 +471,12 @@ async def _shape_chat_response(*, result, session_id, history_baseline, request_
         ai_messages = [m for m in result.get("messages", []) if hasattr(m, "type") and m.type == "ai"]
         proposal_text = (ai_messages[-1].content if ai_messages else interrupt_payload.get("proposal_excerpt", "")) or ""
 
+        # Rename spans so Elastic APM shows the agent name in trace lists,
+        # not the generic "sdc.agent.session" for every request.
+        span.update_name(f"sdc.agent.session [{agent}]")
+        if http_span is not None:
+            http_span.update_name(f"POST /api/chat [{agent}]")
+        span.set_attribute("agent.name",           AGENT_NAMES.get(agent, agent))
         span.set_attribute("sdc.agent",            agent)
         span.set_attribute("sdc.hitl.interrupted", True)
         span.set_attribute("sdc.latency_ms",       round(latency_ms, 1))
@@ -497,9 +507,20 @@ async def _shape_chat_response(*, result, session_id, history_baseline, request_
     agent = result.get("current_agent", "incident")
     routing_reason = result.get("routing_reason", "")
 
-    # Enrich the root span with routing outcome
+    # Rename spans so Elastic APM shows the agent name in trace lists,
+    # not the generic "sdc.agent.session" / "POST /api/chat" for every request.
+    agent_label = AGENT_NAMES.get(agent, agent)   # e.g. "Incident Response"
+    span.update_name(f"sdc.agent.session [{agent_label}]")
+    if http_span is not None:
+        http_span.update_name(f"POST /api/chat [{agent_label}]")
+
+    # Enrich the root span with routing outcome.
+    # agent.name at the span level overrides the SDK resource-level value
+    # ("opentelemetry/python") in Elastic APM trace documents, so the APM UI
+    # and Kibana Discover both show the real agent name for each transaction.
+    span.set_attribute("agent.name",         agent_label)
     span.set_attribute("sdc.agent",          agent)
-    span.set_attribute("sdc.agent.name",     AGENT_NAMES.get(agent, agent))
+    span.set_attribute("sdc.agent.name",     agent_label)   # keep for backwards compat
     span.set_attribute("sdc.routing.reason", routing_reason)
     span.set_attribute("sdc.latency_ms",     round(latency_ms, 1))
 
@@ -552,6 +573,7 @@ async def chat_resume(req: ResumeRequest):
     """
     session_id = req.session_id
     t0 = time.perf_counter()
+    http_span = trace.get_current_span()
     with _tracer.start_as_current_span(
         "sdc.agent.session.resume",
         kind=trace.SpanKind.SERVER,
@@ -582,7 +604,7 @@ async def chat_resume(req: ResumeRequest):
         return await _shape_chat_response(
             result=result, session_id=session_id,
             history_baseline=max(0, len(prior) - 4),  # show last few new entries
-            request_text=f"(resume: {req.value})", t0=t0, span=span,
+            request_text=f"(resume: {req.value})", t0=t0, span=span, http_span=http_span,
         )
 
 

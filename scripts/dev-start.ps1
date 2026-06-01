@@ -47,24 +47,32 @@ if (-not $cachedExists) {
 }
 
 # 3. Apply manifests
-Write-Host "`n[3/5] Applying manifests..." -ForegroundColor Cyan
+Write-Host "`n[3/6] Applying manifests..." -ForegroundColor Cyan
 kubectl apply -f "$ProjectRoot\k8s\namespace.yaml"
 kubectl apply -f "$ProjectRoot\k8s\configmap.yaml"
 kubectl apply -f "$ProjectRoot\k8s\ollama\"
 kubectl apply -f "$ProjectRoot\k8s\chromadb\"
 kubectl apply -f "$ProjectRoot\k8s\redis\"
+kubectl apply -f "$ProjectRoot\k8s\otel-collector\"
 kubectl apply -f "$ProjectRoot\k8s\sdc-agents\"
 
 # 4. Wait for pods to be Ready
-Write-Host "`n[4/5] Waiting for core pods to be Ready..." -ForegroundColor Cyan
+Write-Host "`n[4/6] Waiting for core pods to be Ready..." -ForegroundColor Cyan
 kubectl wait --for=condition=ready pod -l app=ollama     -n sdc --timeout=120s
 kubectl wait --for=condition=ready pod -l app=chromadb   -n sdc --timeout=60s
 kubectl wait --for=condition=ready pod -l app=redis      -n sdc --timeout=30s
 kubectl wait --for=condition=ready pod -l app=sdc-agents -n sdc --timeout=180s
 Write-Host "  All pods Ready." -ForegroundColor Green
 
-# 5. Start port-forwards in background
-Write-Host "`n[5/5] Starting port-forwards..." -ForegroundColor Cyan
+# 5. Run ChromaDB ingest (must run every reboot — ChromaDB data is in-memory only)
+Write-Host "`n[5/6] Running ChromaDB ingest (runbooks + records)..." -ForegroundColor Cyan
+kubectl delete job sdc-ingest -n sdc --ignore-not-found 2>$null | Out-Null
+kubectl apply -f "$ProjectRoot\k8s\jobs\ingest.yaml"
+kubectl wait --for=condition=complete job/sdc-ingest -n sdc --timeout=300s
+Write-Host "  Ingest complete." -ForegroundColor Green
+
+# 6. Start port-forwards in background
+Write-Host "`n[6/6] Starting port-forwards..." -ForegroundColor Cyan
 foreach ($port in 8000, 11434, 8001, 6379) {
     Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue |
         Select-Object -ExpandProperty OwningProcess -Unique |

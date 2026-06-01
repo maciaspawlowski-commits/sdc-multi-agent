@@ -14,6 +14,9 @@ spec:
     metadata:
       labels:
         app: sdc-agents
+      annotations:
+        # OTel Collector (k8s/otel-collector/) handles all routing to Elastic.
+        dash0.com/instrument: "false"
     spec:
       initContainers:
         # Wait for Ollama API to respond before starting the app.
